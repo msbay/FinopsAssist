@@ -1,184 +1,235 @@
-# FinOps Co-Pilot
+# FinOps Assistant
 
-Automated Recharging Item ID prediction for the monthly GO Report mapping process. Combines fast deterministic matching with targeted LLM reasoning, exposed through an interactive dashboard.
+Automated `Recharging_Item_ID` prediction for the monthly GO Report mapping process. A fast **deterministic matcher** classifies every row and produces a calibrated confidence; a **tool-using enrichment agent** investigates only the low-confidence rows and proposes a mapping with evidence; a human confirms, and the confirmed decision **feeds back into the learning data** so the system improves each cycle. All of it is driven from an interactive dashboard.
 
 ---
 
 ## Problem
 
-Each month, ~800 new cloud accounts/subscriptions/resource groups appear in the GO Report that need to be mapped to a `Recharging_Item_ID` (one of ~76 cost categories). Today this is done manually by analysts who compare new entries against ~3,800 historically mapped ones, looking at account names, resource groups, and tags. This is slow, repetitive, and error-prone.
+Each month, ~800 new cloud accounts / subscriptions / resource groups appear in the GO Report that must be mapped to a `Recharging_Item_ID` (one of ~76 cost categories). Today an analyst does this by hand, comparing each new entry against ~3,800 historically mapped ones — looking at account names, resource groups, and tags. It is slow, repetitive, and error-prone, and the hardest rows (opaque names, near-ties between categories) are exactly the ones a human spends the most time on.
 
-## Solution Architecture
+---
 
-The system follows a three-layer design that separates deterministic processing from LLM reasoning from user interaction:
+## How it works (end to end)
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    INTERFACE (app.py)                     │
-│  Streamlit dashboard: table, filters, overrides, chat    │
-├──────────────────────────────────────────────────────────┤
-│                 BRAIN (LLM checkpoint)                    │
-│  Called only for low-confidence rows (~5%)                │
-│  Adds Reasoning_Justification column                     │
-├──────────────────────────────────────────────────────────┤
-│              ENGINE (matcher.py + run_pipeline.py)        │
-│  Deterministic: load → validate → match → output         │
-│  Embeddings + fuzzy matching, confidence scoring          │
-└──────────────────────────────────────────────────────────┘
+   GO Report .xlsx
+   (GO_MAPPING_EMPTY = rows to classify,
+    GO_MAPPING_LEARNING = ~3,800 historical mappings)
+          │
+          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  ENGINE  — deterministic   (matcher.py)                       │
+│  exact lookup  →  char n-gram logistic-regression classifier  │
+│  emits per row:  Predicted_ID · Confidence · Top_Matches      │
+│                  · Needs_Review · Match_Method · Review_Reason │
+└─────────────────────────────────────────────────────────────┘
+          │  high confidence (≈60%)        │  low confidence / flagged (≈40%)
+          ▼  auto-accepted                  ▼
+                                  ┌─────────────────────────────────────────┐
+                                  │  AGENT  — investigates  (agent.py +       │
+                                  │           agent_tools.py + review.py)     │
+                                  │  • candidates = that row's Top_Matches    │
+                                  │  • tools: find_similar_mappings (live),   │
+                                  │    cloud/CMDB/wiki lookups (stubbed)      │
+                                  │  • proposes ONE candidate ID + evidence   │
+                                  │  • never invents an ID, never commits     │
+                                  └─────────────────────────────────────────┘
+                                                   │  proposal
+                                                   ▼
+                                  ┌─────────────────────────────────────────┐
+                                  │  HUMAN  — Accept / Override  (app.py)     │
+                                  │  confirmed mapping is appended to         │
+                                  │  GO_MAPPING_LEARNING (audited)            │
+                                  └─────────────────────────────────────────┘
+                                                   │
+                                                   └──► next run trains on it  ⟲
+```
+
+The two AI/LLM touchpoints are **scoped and optional**: the matcher is pure scikit-learn and always runs; the agent runs **only on the rows the matcher flags**. If Bedrock is unavailable the deterministic results still stand — you just don't get agent proposals.
+
+---
+
+## Architecture
+
+Three layers, separating deterministic processing from agentic reasoning from user interaction:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    INTERFACE  (app.py)                         │
+│  Streamlit: Results tab · Review Queue tab · chat sidebar      │
+├──────────────────────────────────────────────────────────────┤
+│        AGENT  (agent.py · agent_tools.py · review.py)          │
+│  Tool-using enrichment agent, run on Needs_Review rows only.   │
+│  Constrained to the matcher's candidates; proposes, never      │
+│  commits. Confirmed decisions feed back to the learning data.  │
+├──────────────────────────────────────────────────────────────┤
+│        ENGINE  (matcher.py · run_pipeline.py)                  │
+│  Deterministic: load → validate → match → output.              │
+│  Exact lookup + char n-gram classifier, calibrated confidence. │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### Why this design?
 
 | Alternative considered | Why we rejected it |
 |---|---|
-| Full LLM agent deciding tool order | Non-deterministic execution is a compliance risk for a financial pipeline. The LLM might skip validation or change behavior across model versions. |
-| LLM matching all 811 rows | Slow (~3 min vs. ~3 sec), expensive, non-deterministic, and no real numeric confidence score. Embeddings + fuzzy matching are faster, cheaper, and give explainable scores. |
-| Chat-only interface for overrides | Typing "override row 47 to PSO_ITM_361" for 50 rows is unusable. Dropdowns and clicks are faster for data correction. |
-| Feeding raw rows to LLM for filtering | Context window bloat and unnecessary cost. Filtering is a pandas operation, not an LLM task. |
+| Let one LLM agent run the *whole* pipeline (decide tool order, do the matching) | Non-deterministic execution is a compliance risk for a financial pipeline. The match/validate spine stays deterministic; the agent is **scoped to the review layer**, with read-only tools, constrained to the classifier's candidate list, and proposing rather than committing. |
+| LLM matching all 811 rows | Slow (~3 min vs ~3 sec), expensive, non-deterministic, and no real numeric confidence. A trained classifier is faster, cheaper, and gives a calibrated probability. The agent earns its cost only on the ~40% the classifier is unsure about. |
+| Neural sentence embeddings (e.g. `bge-small`) | Benchmarked: they don't beat character n-grams here. Cloud account names are structured identifiers (`prod-axa-dcs-01`), not prose — char n-grams capture the naming conventions directly. |
+| Hand-weighted fuzzy scoring | Benchmarked: a learned classifier beats hand-tuned field weights (+3–5pp) and yields a *calibrated* confidence for free. |
+| Let the agent pick any `Recharging_Item_ID` | It could hallucinate an ID that doesn't fit the row — unacceptable for cost allocation. A guardrail forces `needs_human` if the proposal isn't in the candidate list. |
+| Chat-only interface for overrides | Typing "override row 47 to PSO_ITM_361" for 50 rows is unusable. Tables, dropdowns, and one-click Accept are faster for data correction. |
 
 ---
 
-## Matching Logic (`src/matcher.py`)
+## The Engine — matching logic (`src/matcher.py`)
 
-### Text Representation
+### Text representation
 
-Each row is converted to a single string for comparison:
+Each row becomes one string for comparison:
 
 ```
 {SubAccountName} | {ResourceGroupName} | {tag_dcs} | {tag_app}
 ```
 
-**Why these fields?**
-- `SubAccountName` — primary identifier, carries naming conventions (e.g. `prod-axa-dcs-01`)
-- `ResourceGroupName` — highly informative for Azure resources (e.g. `z-ago-finops-cfp-ew1-rg01`), always present. The original proposal ignored this field — we added it because it's the most reliable secondary signal.
-- `tag_dcs` / `tag_app` — useful when present, but **35% null** in the data, so they act as tiebreakers, not primary signals.
+- **`SubAccountName`** — primary identifier; carries naming conventions (`prod-axa-dcs-01`).
+- **`ResourceGroupName`** — highly informative for Azure (`z-ago-finops-cfp-ew1-rg01`), almost always present; the strongest secondary signal.
+- **`tag_dcs` / `tag_app`** — useful when present but ~35% null, so they act as tiebreakers.
+- **`SubAccountId`** is excluded — a GUID/numeric id has no lexical similarity to other ids.
 
-`SubAccountId` is excluded from the text representation because it's a numeric/GUID identifier with no semantic or lexical similarity to other IDs.
+### Two-layer prediction
 
-### Hybrid Scoring (40% Semantic / 60% Fuzzy)
+**Layer 1 — exact lookup (cheap, certain).** A row whose `(SubAccountName, ResourceGroup)` was already seen inherits that `Recharging_Item_ID` at confidence 100. An *unambiguous* name (always one ID historically) gets 95. ~44% of monthly rows are accounts seen before — handled deterministically, no model.
 
-Each new item is compared against all ~3,700 reference items using two complementary signals:
+**Layer 2 — learned classifier (generalizes to new accounts).** Everything else goes to a **multinomial logistic regression** over **character n-gram TF-IDF** (`char_wb`, n-grams 2–4). Char n-grams capture `prod`, `dcs`, `-rg01` and naming-convention variants directly; benchmarked against `BAAI/bge-small-en-v1.5` embeddings, the neural signal added nothing.
 
-**1. Semantic similarity (40% weight)** — `sentence-transformers` with `BAAI/bge-small-en-v1.5`
-- Embeds the text representation into a 384-dim vector
-- Cosine similarity against all reference vectors
-- Catches "means the same thing but worded differently"
-- At ~3,700 reference items, this is an in-memory NumPy dot product — no vector database needed
+### Review routing
 
-**2. Fuzzy string matching (60% weight)** — `rapidfuzz` token-sort ratio
-- Character-level similarity normalized to 0-1
-- Catches naming convention variants: `prod-axa-dcs-01` vs `prod-axa-dcs-02`
-- Critical because cloud account names are structured identifiers, not natural language
+Beyond the confidence threshold, the matcher isolates rows the *clues themselves* can't determine (`_evidence_reason`):
 
-**Why 60% fuzzy / 40% semantic (not the reverse)?**
+- **no clue** — opaque/short name, no resource group or tags → always review.
+- **weak** — name only → always review.
+- **check with LLM** — has a resource group and/or tags but the pattern is ambiguous → review when confidence is low; this is where the agent adds the most value.
 
-Cloud infrastructure naming follows strict conventions. A semantic model doesn't know that `prod` means production or that `dcs` is a division code, but fuzzy matching catches these trivially. We weight fuzzy higher because the data is structured identifiers, not prose. This can be tuned after evaluating results on real data.
+### Confidence score (0–100)
 
-### Embedding Model Choice: `BAAI/bge-small-en-v1.5`
+The classifier's own `predict_proba` for its top pick, scaled to 0–100 (exact lookups get 100/95):
 
-| Model | Size | Why / why not |
-|---|---|---|
-| **`BAAI/bge-small-en-v1.5`** (chosen) | 33 MB | Fast, small, runs locally. Short structured strings don't need a large model. |
-| `BAAI/bge-m3` | 2 GB | Overkill. Designed for long multilingual documents, not 5-word account names. |
-| `text-embedding-3-small` (OpenAI) | API | Data residency concern — internal cost/ownership data should not leave the infrastructure. |
-| `EmbeddingGemma-300M` | 300 MB | Good alternative if multilingual support is needed later. |
+- **≥ 70** — high (green), auto-accept
+- **50–69** — medium (yellow), worth checking
+- **< 50** — low (red), flagged for review
 
-The model runs **fully on-premises** with no external API calls for the matching step. It can be swapped by changing the `model_name` parameter.
-
-### Confidence Score (0–100)
-
-Confidence combines three signals into a single number:
-
-```
-confidence = (0.5 × best_score + 0.3 × margin + 0.2 × agreement) × 100
-```
-
-| Signal | Weight | What it measures |
-|---|---|---|
-| `best_score` | 50% | How similar is the top match (hybrid score) |
-| `margin` | 30% | Gap between the best match and the best match with a *different* Recharging_Item_ID. High margin = clear winner. |
-| `agreement` | 20% | Fraction of top-5 neighbors sharing the same ID. 5/5 = unambiguous. |
-
-- **≥ 70**: High confidence (green) — auto-accept
-- **50–69**: Medium confidence (yellow) — worth checking
-- **< 50**: Low confidence (red) — flagged for review, sent to LLM
-
-The threshold (`confidence_threshold=50.0`) controls where "needs review" starts. Adjustable based on the team's risk tolerance.
-
-### Data Cleaning
-
-- Rows in `GO_MAPPING_LEARNING` with a null `Recharging_Item_ID` are excluded from the index (4% of rows)
-- `NaN` values in tags are filtered out of the text representation (not passed as the string "nan")
-- Column names differ between sheets (`Custom.focus_costs[...]` vs `focus_costs[...]`) — handled via separate column mappings
+Per-row outputs: `Predicted_Recharging_Item_ID`, `Confidence`, `Top_Matches` (top-3, the agent's candidate list), `Needs_Review`, `Match_Method`, `Review_Reason`.
 
 ---
 
-## Pipeline (`src/run_pipeline.py`)
+## The Agent — enrichment of review rows (`src/agent.py`, `src/agent_tools.py`, `src/review.py`)
 
-A rigid, deterministic 4-step sequence. The LLM never decides the order — it's called at a fixed checkpoint.
+For the rows the matcher flags, the agent recovers signal the classifier lacks.
 
-### Step 1: Load & Validate
-- Reads both sheets from the Excel file
-- Verifies all required columns exist (fails fast with a clear error)
-- Warns if any rows have missing `SubAccountName`
+**What it receives.** The flagged row plus its **candidate list parsed from `Top_Matches`** (`review.parse_candidates`). It may only recommend an ID from that list.
 
-### Step 2: Build Index & Predict
-- Creates embeddings for all reference items
-- Runs hybrid matching for every row in `GO_MAPPING_EMPTY`
-- Pure Python/NumPy — deterministic, no external calls
+**How it investigates** (`EnrichmentAgent.investigate`, up to 5 steps). It decides which tools to call:
 
-### Step 3: LLM Checkpoint (Bedrock)
-- **Only fires for rows where `Needs_Review = True`** (typically ~5%)
-- Sends each ambiguous row + its top-3 candidates to the LLM
-- The LLM picks the best match and writes a one-sentence justification
-- If Bedrock is unavailable, the pipeline still completes — justification column is left empty
-- This is the only non-deterministic step, and it's isolated and optional
+| Tool (`agent_tools.py`) | Status | What it does |
+|---|---|---|
+| `find_similar_mappings` | **live** | TF-IDF char-ngram retrieval over `GO_MAPPING_LEARNING` — "how were comparable accounts classified before?", with similarity scores. The engine of the agent's value today. |
+| `lookup_subscription_owner` | stubbed | Owning team / cost centre for a subscription or opaque GUID account. |
+| `lookup_resource_group_metadata` | stubbed | Live owner/app/environment tags for a resource group. |
+| `search_internal_knowledge` | stubbed | What a naming token or code means (e.g. `bkphost`, `GDAI`). |
 
-### Step 4: Save Results
-- Writes `GO_predictions.xlsx` with all original columns plus:
-  - `Predicted_Recharging_Item_ID`
-  - `Confidence`
-  - `Top_Matches` (top-3 for audit trail)
-  - `Needs_Review` (boolean)
-  - `LLM_Justification` (for reviewed rows)
-- Results are sorted by confidence ascending (worst first for quick review)
+Stubbed tools return a clear `ACCESS_NOT_CONFIGURED` marker; the prompt instructs the agent **not to guess** their contents, so it degrades gracefully instead of hallucinating. Connecting them (registry in `agent_tools.py`) is the biggest future unlock — it's what makes opaque GUID accounts resolvable.
+
+**What it returns** — a structured proposal, never a write:
+
+```json
+{"recommended_id": "PSO_ITM_530", "confidence": 64, "needs_human": false,
+ "reasoning": "one sentence", "evidence": ["similar rows used …"]}
+```
+
+**Guardrails.** Any ID outside the candidate list is rejected → `needs_human`. The agent proposes; a human (or rule) commits. `review.run_review` runs the agent across the flagged rows and attaches `Agent_Proposed_ID / Agent_Confidence / Agent_Needs_Human / Agent_Reasoning / Agent_Evidence`.
+
+### Feedback loop (`review.commit_decision`)
+
+When a human **Accepts** or **Overrides**, the confirmed `(name, resource group, tags) → Recharging_Item_ID` is appended to `GO_MAPPING_LEARNING` with an audit stamp (`Reviewed_By`, `Reviewed_At`, `Review_Source`). A one-time `.BACKUP` copy is made on first write and all other sheets are preserved. The next run retrains on it, so:
+
+- the classifier sees more examples → **fewer review rows next cycle**, and
+- `find_similar_mappings` retrieves richer history → **better agent proposals**.
+
+This is the compounding loop: the tool gets smarter every month from the analysts' own decisions.
+
+---
+
+## Evaluation (`src/benchmark.py`)
+
+Accuracy is measured honestly on **genuinely new accounts**: `GO_MAPPING_LEARNING` is split **by `SubAccountName`** (group split) so no account appears in both train and test. A plain random split lets near-duplicate rows of the same account leak across and inflates accuracy by ~16 points. ~56% of each month's rows are accounts never seen before, so this is the case that matters. The headline is averaged over several splits (a single split swings ~±8pp by luck).
+
+| Metric (held-out new accounts) | Value |
+|---|---|
+| Accuracy | **~79%** |
+| Auto-accept band (conf ≥70) | ~51% of rows at **~96% accuracy** |
+| Flagged for review (conf <50) | ~32% of rows |
+| Expected Calibration Error | ~13 (lower = better) |
+
+The remaining ~44% of production rows are *seen* accounts that hit exact lookup at 100%, so the blended accuracy is higher than the 79% headline. The hardest cases — `XX_*` catch-all buckets and bare GUIDs with no resource group or tags — are exactly what gets routed to the agent.
+
+Run: `python src/benchmark.py`.
+
+---
+
+## Headless pipeline (`src/run_pipeline.py`)
+
+A rigid, deterministic 4-step batch run for when you just want an enriched Excel file (no UI):
+
+1. **Load & validate** — read both sheets, verify required columns (fail fast), warn on missing names.
+2. **Build index & predict** — train the matcher, predict every `GO_MAPPING_EMPTY` row. Pure scikit-learn.
+3. **LLM checkpoint** — for `Needs_Review` rows only, a single Bedrock call writes a one-sentence `LLM_Justification`. (This is the lightweight batch counterpart to the interactive agent; if Bedrock is down the pipeline still completes with the column left blank.)
+4. **Save** — write `GO_predictions.xlsx` (all original columns + prediction columns), sorted worst-confidence-first.
+
+> The **interactive app** uses the full tool-using `EnrichmentAgent` and the feedback loop; the **headless pipeline** uses the lighter single-shot justification. Same engine, two consumption modes.
 
 ---
 
 ## Dashboard (`src/app.py`)
 
-Interactive Streamlit UI. The analyst sees data, not a chatbox.
+A multi-feature Streamlit app. The sidebar switches between features (via `st.navigation`):
 
-### Main Panel
-- **Metrics bar**: total rows, high confidence count, needs review count, average confidence
-- **Color-coded data table**: green (≥70), yellow (50–69), red (<50)
-- **Filters**: by review status and by predicted ID (native pandas filtering, no LLM)
-- **Manual override**: select row index → pick correct ID from dropdown → apply. No typing.
-- **Excel export**: download the final results including any overrides
+- **🏷️ Cost Allocation** — *live*, described below.
+- **🧹 Tag Hygiene** — *coming soon*: propose the correct tag value for non-compliant resources (same agent pattern as Cost Allocation).
 
-### Chat Sidebar
-- For **high-level analysis only**, not for data manipulation
-- The LLM receives a compact summary (counts, averages, top IDs) — never raw rows
-- If the user asks to filter data, the LLM returns a pandas query to execute server-side
-- Examples: "Why did unmatched rows spike this month?", "Summarize the main cost categories"
+New features are added as a page function + one entry in the navigation catalogue.
+
+### Cost Allocation feature
+
+Interactive UI — the analyst sees data, not a chatbox. Three tabs:
+
+- **📊 Results** — metrics bar (total / auto / needs-review / avg confidence), color-coded table (🟢≥70 🟡50–69 🔴<50), filters by status and predicted ID (native pandas, no LLM), and **Download to Excel**.
+- **🔍 Review Queue** — choose how many flagged rows to investigate, run the agent, then one expandable card per row: the proposed ID, confidence, **reasoning**, **evidence**, a candidate radio, and **Accept & commit** (writes back to the learning data).
+- **ℹ️ About** — legend for the confidence bands and match methods.
+- **Chat sidebar** — high-level questions about the current batch only (the LLM gets a compact summary, never raw rows). e.g. "How many rows need review?", "Top cost categories?".
+
+**Data source:** upload a GO Report `.xlsx` in the sidebar, or leave it empty to use the bundled file. Uploaded files are *batches to classify*; confirmed decisions always append back to the canonical learning workbook so knowledge accrues in one place.
 
 ---
 
-## Project Structure
+## Project structure
 
 ```
-FinopsAgent/
+FinopsAssist/
 ├── src/
-│   ├── main.py            # LLM setup (Bedrock client, get_llm helper)
-│   ├── matcher.py         # Hybrid matching engine
-│   ├── run_pipeline.py    # Deterministic 4-step pipeline
-│   └── app.py             # Streamlit dashboard
-├── GO Report Extract LIGHT_V2.xlsx   # Input data
-├── GO_predictions.xlsx               # Output (generated)
+│   ├── main.py            # Bedrock client + get_llm() + connectivity test
+│   ├── matcher.py         # Engine: exact lookup + char n-gram classifier
+│   ├── agent.py           # EnrichmentAgent — tool-using investigator
+│   ├── agent_tools.py     # Agent tools (find_similar_mappings live; rest stubbed)
+│   ├── review.py          # Matcher→agent bridge + feedback-loop write-back
+│   ├── run_pipeline.py    # Headless deterministic 4-step batch pipeline
+│   ├── benchmark.py       # Group-split accuracy & calibration benchmark
+│   └── app.py             # Multi-feature Streamlit app (Home + Cost Allocation)
+├── GO Report Extract LIGHT_V2.xlsx   # Input data (learning + empty sheets)
+├── GO_predictions.xlsx               # Output of run_pipeline.py (generated)
 ├── pyproject.toml
-├── .env                   # AWS credentials + config
-├── .env.example
-├── .gitignore
+├── .env                              # AWS credentials + config (gitignored)
 └── README.md
 ```
 
@@ -188,42 +239,46 @@ FinopsAgent/
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate          # Windows
+source .venv/bin/activate            # macOS/Linux  (.venv\Scripts\activate on Windows)
 pip install -e ".[dev]"
 ```
 
-Copy `.env.example` to `.env` and configure:
+Create a `.env` in the project root (gitignored — never commit real keys):
 
 ```env
-AWS_ACCESS_KEY_ID=...
-AWS_SECRET_ACCESS_KEY=...
-AWS_REGION=us-east-1
-BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-20250514-v1:0
+AWS_REGION=eu-central-1
+BEDROCK_MODEL_ID=eu.amazon.nova-2-lite-v1:0
+AWS_ACCESS_KEY_ID=<your-access-key-id>
+AWS_SECRET_ACCESS_KEY=<your-secret-access-key>
+# AWS_SESSION_TOKEN=                  # only for temporary credentials
 ```
+
+`get_llm()` passes these explicitly to boto3 and **fails fast if any are missing** — it never falls back to ambient `~/.aws` credentials (avoids hitting the wrong account).
+
+---
 
 ## Run
 
 ```bash
-# CLI pipeline (headless, writes GO_predictions.xlsx)
-python src/run_pipeline.py
-
-# Interactive dashboard
-streamlit run src/app.py
-
-# Test Bedrock connectivity
-python src/main.py test
+python src/main.py            # test Bedrock connectivity
+streamlit run src/app.py      # interactive dashboard (recommended)
+python src/run_pipeline.py    # headless batch → GO_predictions.xlsx
+python src/benchmark.py       # accuracy & calibration (group split by account)
+python src/agent.py           # single-row agent demo
 ```
 
 ---
 
-## Data Requirements
+## Data requirements
 
 Input file: `GO Report Extract LIGHT_V2.xlsx` with these sheets:
 
 | Sheet | Purpose | Key columns |
 |---|---|---|
-| `GO_MAPPING_LEARNING` | Historical mappings (reference) | `Custom.focus_costs[SubAccountName]`, `Custom.focus_costs[axa_Azure_ResourceGroupName]`, `Custom.focus_costs[axa_tags_global_dcs]`, `Custom.focus_costs[axa_tags_global_app]`, `Custom.gld_referential_mdm_axagorechargingitem[Recharging_Item_ID]` |
-| `GO_MAPPING_EMPTY` | New items to predict | `focus_costs[SubAccountName]`, `focus_costs[axa_Azure_ResourceGroupName]`, `focus_costs[axa_tags_global_dcs]`, `focus_costs[axa_tags_global_app]` |
+| `GO_MAPPING_LEARNING` | Historical mappings (reference) | `Custom.focus_costs[SubAccountName]`, `…[axa_Azure_ResourceGroupName]`, `…[axa_tags_global_dcs]`, `…[axa_tags_global_app]`, `Custom.gld_referential_mdm_axagorechargingitem[Recharging_Item_ID]` |
+| `GO_MAPPING_EMPTY` | New items to predict | `focus_costs[SubAccountName]`, `…[axa_Azure_ResourceGroupName]`, `…[axa_tags_global_dcs]`, `…[axa_tags_global_app]` |
+
+Column names differ between the two sheets (`Custom.focus_costs[...]` vs `focus_costs[...]`); handled via separate mappings in `matcher.py`.
 
 ---
 
@@ -231,7 +286,35 @@ Input file: `GO Report Extract LIGHT_V2.xlsx` with these sheets:
 
 | Parameter | Location | Default | Effect |
 |---|---|---|---|
-| `semantic_weight` | `matcher.py` `_hybrid_scores()` | `0.4` | Higher = more weight on meaning; lower = more weight on character similarity |
 | `confidence_threshold` | `matcher.py` `predict()` | `50.0` | Lower = fewer rows flagged for review; higher = more conservative |
-| `top_k` | `matcher.py` `predict()` | `5` | Number of neighbors for agreement scoring |
-| `model_name` | `RechargingMatcher.__init__()` | `BAAI/bge-small-en-v1.5` | Swap embedding model without code changes |
+| `NGRAM_RANGE` | `matcher.py` constant | `(2, 4)` | Character n-gram size for the classifier (swept in `benchmark.py`) |
+| `CLF_C` | `matcher.py` constant | `50.0` | Logistic-regression regularization (higher = less regularization) |
+| `MAX_STEPS` | `agent.py` constant | `5` | Max tool-use iterations per review row |
+| Rows to investigate | app Review Queue | `10` | Cap on agent calls per run (each is a live Bedrock call) |
+
+---
+
+## Potential improvement — a value-of-information arbiter
+
+The current design treats the cloud/agent as a **rescuer**: it only fires on rows the classifier already doubts (low confidence). Rethinking the problem from first principles suggests a better topology, given two real constraints — cloud tags are **partial / inconsistent** (evidence, not ground truth) and Azure/AWS access is **per-account lookups only** (enrichment is scarce, can't be run on every row).
+
+**Core insight.** A `Recharging_Item_ID` is a *cost-ownership* label; name/tags/history are only proxies for it. The classifier's ~79% ceiling on new accounts is an **information** limit, not a model limit — the input underdetermines the answer. The cloud can supply the missing signal, but it's noisy and rationed, so the goal is to spend a lookup **only where it will change the decision**.
+
+This means escalating on **novelty and cost**, not just low confidence — because the classifier's worst failure is being *confidently wrong* on accounts unlike anything in history, which a confidence threshold never catches.
+
+Proposed routing brain (a small change in front of the existing agent):
+
+1. **Novelty signal** — add *max similarity of the account to history* as a first-class routing feature. Low similarity ⇒ the classifier is extrapolating ⇒ enrich, even if its probability looks peaked. *(Highest-leverage first build.)*
+2. **Cost weighting** — rank flagged rows by `expected_accuracy_gain × Sumaxa_EffectiveCost_EUR`. A wrong recharge on a €50k account matters far more than on a €5 one; spend scarce lookups and human attention on the high-spend, high-uncertainty rows first. (The EUR column already exists and is currently unused.)
+3. **Cloud as weighted evidence + agreement check** — when a per-account lookup returns an owner/cost-centre tag, cross-check it against what history mapped similar accounts to: **agree → auto-accept at high confidence; disagree → surface as the highest-value human review** with both sides. This turns inconsistent tags from a liability into a calibration signal.
+4. **Aggressive caching** — cache lookups by account ID. Accounts recur month to month, so the rationed API is hit ~once per account ever; incremental cost approaches zero after the first pass, which is what makes selective enrichment affordable.
+
+Net: the cheap classifier still decides most rows; a *selective* cloud-enrichment + reconciliation step is spent only where novelty and spend say it pays off. Everything worth keeping today (exact lookup, calibrated classifier, candidate-list guardrail, feedback loop) stays — only the routing logic in `matcher.py` changes.
+
+---
+
+## Known limits / next steps
+
+- **Connect the stubbed agent tools** (cloud/CMDB/wiki) — the biggest unlock; turns the agent from "smart pattern-matcher over history" into one that resolves accounts history can't explain.
+- **Agent throughput/cost** — ~40% of rows are flagged; each agent investigation is a live LLM call, so the queue is capped per run. Batch/cache for full-batch enrichment.
+- **Write-back concurrency** — `commit_decision` rewrites the workbook; safe for a small team one-at-a-time. Move the learning store to SQLite when concurrent edits matter.
