@@ -303,12 +303,30 @@ uvicorn api:app --app-dir src/backend            # backend  → http://127.0.0.1
 streamlit run src/frontend/app.py                # frontend → http://localhost:8501
 ```
 
-- Add `--reload` to the backend while developing (auto-restart on edits).
+- While developing, use `uvicorn api:app --app-dir src/backend --reload --reload-dir src/backend`. The `--reload-dir src/backend` is important — **without it the reloader watches the whole tree including `.venv`**, which loops endlessly on large packages and never starts. For just *running* the app, omit `--reload`.
 - Point the UI at a remote backend with `FINOPS_API_URL=http://host:8000 streamlit run src/frontend/app.py`.
 - Bedrock connectivity check: `python src/backend/main.py`.
 
 The backend needs valid Bedrock credentials in `.env`; without them the classifier still
 runs and the review queue can be filled in manually (the LLM step surfaces a warning).
+
+---
+
+## Troubleshooting
+
+**Backend "keeps loading" / never starts.** You launched with `--reload` and no `--reload-dir`, so the file-watcher is scanning `.venv` (e.g. a large package like `transformers`/`torch`) in a loop. Run without `--reload`, or scope it: `--reload --reload-dir src/backend`. Confirm the API is up at `http://127.0.0.1:8000/health`.
+
+**First run is slow.** Expected. Train + predict is a few seconds, but the LLM then analyses the *whole* review queue in the background (~1 Bedrock call/row, a few minutes on a full batch) — watch the Review-queue progress bar. The first run also pays one-time warm-ups (heavy imports, building the evidence index, first Bedrock connection). Ready-to-approve is usable immediately while the review job runs.
+
+**`transformers`/`torch` in your `.venv` (heavy, slow startup).** These are **not** project dependencies — they came from a stray install in that venv. Recreate a clean env:
+```bash
+# from the project root, venv deactivated
+rm -rf .venv                                  # Windows: rmdir /s /q .venv
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[backend,frontend,dev]"      # transformers/torch will NOT be pulled
+```
+
+**`Run pipeline` errors / "Backend unavailable".** The UI can't reach the API. Make sure the backend is running first, and that `FINOPS_API_URL` (default `http://127.0.0.1:8000`) points at it.
 
 ---
 
