@@ -10,3 +10,13 @@ build/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+
+# OS cruft
+.DS_Store
+
+# Office temp lock files (leading ~$)
+~$*
+
+# Generated / transient data artifacts
+GO_predictions.xlsx
+*.BACKUP.xlsx

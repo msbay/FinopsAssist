@@ -1,0 +1,8 @@
+# FinOps Assistant theme — AXA-branded, applied app-wide.
+[theme]
+primaryColor = "#00008F"                 # AXA blue: buttons, focus rings, selection
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F3F4F8"     # sidebar + table header — softer than default grey
+textColor = "#1A1A2E"
+font = "sans serif"
+baseRadius = "0.6rem"                     # slightly rounder cards / buttons / inputs

@@ -1,0 +1,239 @@
+"""Review-queue layer: bridges the matcher's output to the FinOps assistant, and
+commits confirmed decisions back into the learning data (the feedback loop).
+
+The deterministic matcher (matcher.py) ranks IDs and flags low-confidence rows for
+review. This module:
+  1. run_review        — runs FinopsAssistant over the Needs_Review rows only,
+     attaching the agent's proposal/evidence as new columns.
+  2. commit_decisions  — appends human-confirmed (row -> Recharging_Item_ID) mappings
+     to GO_MAPPING_LEARNING with an audit stamp, so the next pipeline run retrains on
+     them. This is what makes the system improve each cycle.
+  3. recall_decision   — undoes a committed decision.
+
+No function here ever auto-writes a Recharging_Item_ID into the prediction output —
+a human Accept/Override is always the trigger for a commit.
+"""
+
+import re
+import shutil
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+from agent import FinopsAssistant
+from matcher import (
+    ACTION_AGENT,
+    EMPTY_COLS,
+    LEARNING_COLS,
+    normalize_schema,
+)
+
+LEARNING_SHEET = "GO_MAPPING_LEARNING"
+
+
+def _row_to_agent_input(row: pd.Series) -> dict:
+    """Map a GO_MAPPING_EMPTY row to the dict shape FinopsAssistant.investigate wants."""
+    def field(col_key: str) -> str:
+        v = str(row.get(EMPTY_COLS[col_key], "") or "").strip()
+        return "" if v.lower() == "nan" else v
+
+    return {
+        "provider": field("provider"),
+        "name": field("sub_account_name"),
+        "resource_group": field("resource_group"),
+        "tag_dcs": field("tag_dcs"),
+        "tag_app": field("tag_app"),
+        "sub_account_id": field("sub_account_id"),
+    }
+
+
+# Columns the agent contributes to the results frame, with their blank defaults.
+# Kept as object dtype so a row can hold a str ID, an int confidence or a bool.
+AGENT_COL_DEFAULTS = {"Agent_Proposed_ID": "", "Agent_Confidence": 0,
+                      "Agent_Needs_Human": False, "Agent_Reasoning": "",
+                      "Agent_Evidence": "", "Agent_Tokens": 0}
+
+
+_SCORED = re.compile(r"^\s*(.+?)\s*\(([0-9.]+)\)\s*$")
+
+
+def _parse_scored(candidates) -> list[tuple[str, float | None]]:
+    """Parse a 'id (0.12) | id (0.10)' string (or a plain id list) into (id, prob)
+    pairs, preserving order (the classifier's confidence ranking)."""
+    if not isinstance(candidates, str):
+        return [(c, None) for c in candidates]
+    out = []
+    for token in candidates.split("|"):
+        m = _SCORED.match(token)
+        if m:
+            out.append((m.group(1).strip(), float(m.group(2))))
+        elif token.strip():
+            out.append((token.strip(), None))
+    return out
+
+
+def _named_candidates(candidates, matcher) -> list[dict]:
+    """Attach rank, probability and the semantic tree (Family > Product > Item name)
+    to each candidate, using the matcher's learned hierarchy. `candidates` is the
+    ranked 'id (prob) | ...' string (or a plain id list); order = classifier ranking."""
+    cands = []
+    for rank, (cid, prob) in enumerate(_parse_scored(candidates), 1):
+        fam, prod, name = matcher._ancestry(cid) if matcher is not None else ("", "", cid)
+        cands.append({"id": cid, "name": name, "family": fam, "product": prod,
+                      "prob": prob, "rank": rank})
+    return cands
+
+
+def run_review(results: pd.DataFrame, matcher=None, agent: FinopsAssistant | None = None,
+               max_rows: int | None = None, progress=None, only_idx=None) -> pd.DataFrame:
+    """Run the FinOps assistant over the Needs_Review rows, constrained to each row's
+    own Top_Matches candidates. Returns a copy of `results` with AGENT_COLS attached
+    (blank on rows that were not reviewed).
+
+    `matcher` supplies the learned Family/Product/name tree so the agent reasons over
+    semantic names rather than opaque ids. `progress(done, total)` is an optional
+    callback for UI progress bars. `only_idx`, if given, restricts the run to that
+    explicit set of row indices (the rows a user selected in the Review Queue) — still
+    intersected with the eligible "Send to agent" set so no-signal rows are never wasted.
+    """
+    out = results.copy()
+    for col, default in AGENT_COL_DEFAULTS.items():
+        if col not in out.columns:
+            out[col] = pd.Series([default] * len(out), index=out.index, dtype=object)
+
+    # Route by the validated ladder: only "Send to agent" rows go to the LLM (low
+    # confidence WITH signal). High-confidence rows are for human approval; no-signal
+    # rows have nothing to reason over and need owner/enrichment — the agent skips both.
+    if "Suggested_Action" in out.columns:
+        eligible = out["Suggested_Action"] == ACTION_AGENT
+    else:  # older frames without the column: fall back to the equivalent predicate
+        eligible = out["Needs_Review"]
+    if only_idx is not None:  # honour an explicit user selection, but stay within eligible
+        eligible = eligible & out.index.isin(list(only_idx))
+    review_idx = out.index[eligible].tolist()
+    # Prioritise by € spend: map the highest-cost eligible rows first, so a capped agent
+    # run (max_rows) spends its budget where the money is.
+    cost_col = EMPTY_COLS["cost"]
+    if cost_col in out.columns:
+        cost = pd.to_numeric(out[cost_col], errors="coerce").fillna(0)
+        review_idx.sort(key=lambda i: cost.at[i], reverse=True)
+    if max_rows is not None:
+        review_idx = review_idx[:max_rows]
+    if not review_idx:
+        return out
+
+    agent = agent or FinopsAssistant()
+    for n, idx in enumerate(review_idx, 1):
+        row = out.loc[idx]
+        # No-signal rows are in the queue too, but there's nothing for the agent to reason
+        # over — mark them for a human WITHOUT spending an LLM call (uniform card, 0 tokens).
+        if str(row.get("Match_Method", "")) == "no_signal":
+            out.at[idx, "Agent_Proposed_ID"] = ""
+            out.at[idx, "Agent_Confidence"] = 0
+            out.at[idx, "Agent_Needs_Human"] = True
+            out.at[idx, "Agent_Reasoning"] = ("No signal (opaque/empty name, no resource "
+                                              "group or tags) — needs a human / owner.")
+            out.at[idx, "Agent_Evidence"] = ""
+            out.at[idx, "Agent_Tokens"] = 0
+            if progress:
+                progress(n, len(review_idx))
+            continue
+        # Prefer the wider, high-recall nucleus set (Candidate_IDs); fall back to Top_Matches.
+        cand_src = row.get("Candidate_IDs") or row.get("Top_Matches", "")
+        candidates = _named_candidates(cand_src, matcher)
+        proposal = agent.investigate(_row_to_agent_input(row), candidates)
+        # Always surface a best guess: if the agent abstained, fall back to the top-ranked
+        # candidate (the classifier's #1) so the prediction cell is never empty.
+        pred = proposal.get("recommended_id") or ""
+        if not pred and candidates:
+            pred = candidates[0].get("id", "")
+        out.at[idx, "Agent_Proposed_ID"] = pred
+        out.at[idx, "Agent_Confidence"] = proposal.get("confidence", 0)
+        out.at[idx, "Agent_Needs_Human"] = bool(proposal.get("needs_human", True))
+        out.at[idx, "Agent_Reasoning"] = proposal.get("reasoning", "")
+        out.at[idx, "Agent_Evidence"] = " ; ".join(proposal.get("evidence", []) or [])
+        out.at[idx, "Agent_Tokens"] = int(proposal.get("total_tokens", 0))
+        # Rows stay in the Review queue (the admin approves the agent's prediction there);
+        # run_review only fills the Agent_* columns, it never re-routes the row.
+        if progress:
+            progress(n, len(review_idx))
+    return out
+
+
+# ── Feedback loop: commit a confirmed decision back to the learning data ──────
+AUDIT_COLS = {"reviewed_by": "Reviewed_By", "reviewed_at": "Reviewed_At",
+              "source": "Review_Source"}
+
+
+def _learning_record(row: pd.Series, recharging_item_id: str, reviewed_by: str,
+                     source: str, at: str) -> dict:
+    """One GO_MAPPING_LEARNING row (canonical columns) for a confirmed decision."""
+    return {
+        LEARNING_COLS["sub_account_name"]: str(row.get(EMPTY_COLS["sub_account_name"], "") or ""),
+        LEARNING_COLS["sub_account_id"]: str(row.get(EMPTY_COLS["sub_account_id"], "") or ""),
+        LEARNING_COLS["resource_group"]: str(row.get(EMPTY_COLS["resource_group"], "") or ""),
+        LEARNING_COLS["tag_dcs"]: str(row.get(EMPTY_COLS["tag_dcs"], "") or ""),
+        LEARNING_COLS["tag_app"]: str(row.get(EMPTY_COLS["tag_app"], "") or ""),
+        LEARNING_COLS["recharging_item_id"]: recharging_item_id,
+        AUDIT_COLS["reviewed_by"]: reviewed_by,
+        AUDIT_COLS["reviewed_at"]: at,
+        AUDIT_COLS["source"]: source,
+    }
+
+
+def _write_sheets(workbook: Path, sheets: dict) -> None:
+    with pd.ExcelWriter(workbook, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            df.to_excel(writer, sheet_name=name, index=False)
+
+
+def commit_decisions(decisions, reviewed_by: str, workbook: str,
+                     source: str = "human_review") -> list[dict]:
+    """Append several confirmed (row -> Recharging_Item_ID) mappings to
+    GO_MAPPING_LEARNING in a SINGLE workbook write (for dashboard batch-approve).
+
+    `decisions` is an iterable of (row: pd.Series, recharging_item_id: str). Rows with a
+    blank id are skipped (nothing to learn). A one-time .BACKUP is made; audit columns
+    record who/when/how; all other sheets are preserved verbatim. Returns the list of
+    appended learning records (each carries the Reviewed_At stamp used to recall it).
+    """
+    records, at = [], datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for row, rid in decisions:
+        rid = str(rid or "").strip()
+        if rid:
+            records.append(_learning_record(row, rid, reviewed_by, source, at))
+    if not records:
+        return []
+
+    wb = Path(workbook)
+    backup = wb.with_suffix(".BACKUP" + wb.suffix)
+    if not backup.exists():
+        shutil.copy2(wb, backup)
+
+    sheets = pd.read_excel(wb, sheet_name=None)
+    # Normalize to canonical names so the appended rows' columns align (no-op on V3).
+    sheets[LEARNING_SHEET] = normalize_schema(sheets[LEARNING_SHEET])
+    sheets[LEARNING_SHEET] = pd.concat(
+        [sheets[LEARNING_SHEET], pd.DataFrame(records)], ignore_index=True)
+    _write_sheets(wb, sheets)
+    return records
+
+
+def recall_decision(workbook: str, record: dict) -> bool:
+    """Undo a previously committed decision: remove the matching row from
+    GO_MAPPING_LEARNING (identified by its audit stamp + id + account). Removes at most
+    one row and returns whether a match was found. Other sheets are preserved verbatim.
+    """
+    wb = Path(workbook)
+    sheets = pd.read_excel(wb, sheet_name=None)
+    learning = normalize_schema(sheets[LEARNING_SHEET])
+    mask = pd.Series(True, index=learning.index)
+    for col in (AUDIT_COLS["reviewed_at"], AUDIT_COLS["reviewed_by"],
+                LEARNING_COLS["recharging_item_id"], LEARNING_COLS["sub_account_name"]):
+        if col in learning.columns:
+            mask &= learning[col].astype(str) == str(record.get(col, ""))
+    if not mask.any():
+        return False
+    sheets[LEARNING_SHEET] = learning.drop(index=learning.index[mask][0]).reset_index(drop=True)
+    _write_sheets(wb, sheets)
+    return True
