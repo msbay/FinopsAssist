@@ -19,4 +19,4 @@ build/
 
 # Generated / transient data artifacts
 GO_predictions.xlsx
-*.BACKUP.xlsx
+*.xlsx

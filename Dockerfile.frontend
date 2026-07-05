@@ -1,0 +1,27 @@
+# FinOps Assistant — FRONTEND (Streamlit thin client)
+# Multi-stage: build deps into a venv, then copy only the venv + source into a slim runtime.
+
+# ── Stage 1: builder ──────────────────────────────────────────────────────────
+FROM python:3.11-slim AS builder
+WORKDIR /app
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir ".[frontend]"
+
+# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+FROM python:3.11-slim
+WORKDIR /app
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+COPY src/frontend ./src/frontend
+
+RUN chown -R 1001:0 /app && chmod -R g+rwX /app
+USER 1001
+
+EXPOSE 8501
+HEALTHCHECK --interval=10s --timeout=3s --retries=12 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')" || exit 1
+
+CMD ["streamlit", "run", "src/frontend/app.py", \
+     "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]

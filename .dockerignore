@@ -1,0 +1,14 @@
+# keep the build context small & secrets out of images
+.venv/
+.git/
+.github/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+.DS_Store
+.env
+*.md
+docs/
+# data files are mounted at runtime, never baked into the image
+*.xlsx

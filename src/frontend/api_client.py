@@ -10,17 +10,16 @@ import os
 import httpx
 
 API_URL = os.environ.get("FINOPS_API_URL", "http://127.0.0.1:8000")
+# Service token for the backend (only enforced when the backend has FINOPS_API_TOKEN set).
+API_TOKEN = os.environ.get("FINOPS_API_TOKEN")
 _XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-_client = httpx.Client(base_url=API_URL, timeout=300)
+_auth = {"Authorization": f"Bearer {API_TOKEN}"} if API_TOKEN else {}
+_client = httpx.Client(base_url=API_URL, timeout=300, headers=_auth)
 
 
 def _json(resp: httpx.Response):
     resp.raise_for_status()
     return resp.json()
-
-
-def health() -> dict:
-    return _json(_client.get("/health"))
 
 
 def run_batch(file_bytes: bytes | None = None) -> dict:

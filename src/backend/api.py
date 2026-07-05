@@ -10,21 +10,57 @@ Docs:
     http://127.0.0.1:8000/docs
 """
 
+import logging
 import os
 import sys
+from secrets import compare_digest
 
 # Put this module's own dir on the path so the sibling engine modules (service, matcher,
 # review, agent, ...) import by bare name regardless of how uvicorn is launched.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import service
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
+
+# Load .env so it configures the backend in local dev (prod injects real env vars, which
+# take precedence — load_dotenv does not override an already-set variable).
+load_dotenv()
+
+logger = logging.getLogger("finops.api")
+
+# ── Authentication ────────────────────────────────────────────────────────────
+# A shared SERVICE token for the frontend (the Next.js BFF injects it on every call).
+# User/SSO auth is handled upstream by the frontend; this only proves the caller is the
+# trusted frontend, so the internal API can't be driven by anything else.
+#   • FINOPS_API_TOKEN unset  → auth DISABLED (local dev convenience).
+#   • FINOPS_API_TOKEN set     → every request except the open paths must send
+#                                `Authorization: Bearer <token>`.
+API_TOKEN = os.getenv("FINOPS_API_TOKEN")
+_OPEN_PATHS = {"/health", "/docs", "/redoc", "/openapi.json"}
+
+if not API_TOKEN:
+    logger.warning("FINOPS_API_TOKEN is not set — API authentication is DISABLED. "
+                   "Fine for local dev; this MUST be set in production.")
+
+
+def require_token(request: Request, authorization: str | None = Header(default=None)) -> None:
+    """Validate the shared service token (constant-time) on every protected route.
+
+    No-op when FINOPS_API_TOKEN is unset (dev) or for the open paths (health + API docs).
+    """
+    if not API_TOKEN or request.url.path in _OPEN_PATHS:
+        return
+    if not authorization or not compare_digest(authorization, f"Bearer {API_TOKEN}"):
+        raise HTTPException(status_code=401, detail="Invalid or missing API token")
+
 
 app = FastAPI(
     title="FinOps Assistant API",
     version="0.1.0",
     summary="Map new cloud resources to a Recharging Item — classifier + LLM review.",
+    dependencies=[Depends(require_token)],  # applies to every route; open paths exempt above
 )
 
 

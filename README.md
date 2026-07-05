@@ -375,8 +375,86 @@ Net: the cheap classifier still decides most rows; a *selective* cloud-enrichmen
 
 ---
 
+## Roadmap — ownership-confirmation workflow
+
+> **Status: design agreed, not yet built.** Everything above describes what runs today (an
+> Excel-backed batch tool). This section records the target architecture the tool is moving
+> toward, for the org container deployment.
+
+### The reframe
+
+Cost allocation — attributing every cloud account to the team that should pay for it — is slow
+for **two** hands-on reasons: working out **who likely owns** an account, and **getting that
+owner to confirm** before the cost is written to the master. Today's tool automates the first
+(classifier + agent) but leaves the second — the email chasing and the manual master edit —
+entirely manual. The target closes that gap.
+
+### Databricks is the master; the app never writes it
+
+The `.xlsx` files are **extracts from a governed Databricks table** — Databricks is the system of
+record, not the spreadsheet. Target:
+
+- **Read-only** from Databricks (accounts, cost, historical mappings, and the
+  `recharging_item ↔ owner` reference) via a SQL Warehouse + service principal.
+- The app **never writes the master table.** Confirmed decisions flow through a **governed
+  promotion job the data team controls** — append to an app-owned staging table → `MERGE` into the
+  golden table; or a signed file/API batch if no Databricks write is permitted.
+
+This deletes the runtime Excel writes and makes the container **stateless**. (Note the cross-cloud
+split: data on **Azure**/Databricks, the LLM agent on **AWS Bedrock** — two identities to manage,
+or consolidate onto one cloud's LLM.)
+
+### Confirmation workflow
+
+Because `recharging_item ↔ owner` is **1-to-1**, predicting the recharging ID also names the owner
+to contact:
+
+1. Classifier + agent predict the recharging ID (⇒ the likely owner).
+2. The owner is asked **"Is this account yours?"** via a **Microsoft Teams Adaptive Card** (email
+   with a one-click magic link as fallback) — they confirm *ownership*, never a code.
+3. **Yes** ⇒ the recharging ID is confirmed and the account is staged for promotion.
+4. **Anything else** ("no" / "not mine" / "not sure" / no response after reminders) ⇒ **no
+   automated second guess.** The account escalates to a **FinOps admin** who decides (reassign,
+   investigate, park in a provisional bucket, or leave unassigned).
+
+Per-account state machine: `Predicted → Request sent → Awaiting → Confirmed → Ready to promote`,
+with branches for auto-reminders and admin escalation. Every transition is timestamped — the audit
+trail finance needs.
+
+### Where state lives
+
+- **Databricks** — source of truth (read-only), and via the governed job the master mapping.
+- **Postgres (app-owned)** — the *workflow* state only: requests, statuses, confirmations, audit
+  log. **Not** the cost data. This is what lets a multi-day, multi-party approval survive restarts
+  and run on more than one replica.
+
+### Prerequisites (container-readiness)
+
+Before the org container deployment the code needs: config via **environment variables** (workbook
+/ DB path, credentials) instead of a bundled `.env`; **removing** the static-AWS-keys requirement
+and `verify=False` in `main.get_llm()` so it can use a platform role identity over TLS; and
+centralising the hard-coded workbook path (`service.WORKBOOK`, `agent_tools.INPUT_FILE`).
+
+### Phasing
+
+1. **MVP speedboat** — predict the owner + generate a ready-to-send Teams/email draft the analyst
+   sends manually. Zero integration; proves the predictions.
+2. **Workflow + tracking** — one-click send, live status board, magic-link responses, Postgres.
+3. **Teams + automation** — interactive Adaptive Cards, auto-reminders.
+4. **Governed hand-off** — confirmed batch flows into the data team's promotion job.
+
+### Open governance questions
+
+- **Hand-off** — app-owned Databricks staging table (recommended), or a file/API batch into the
+  existing ingestion?
+- **Provisional bucket** — may a non-confirmed account's cost be parked in a temporary
+  "shared / unallocated" item, or must it stay unassigned until resolved?
+- **SLA** — how many reminders / how long before an account auto-escalates to the admin?
+
+---
+
 ## Known limits / next steps
 
 - **Add cloud/CMDB/wiki enrichment** (owner lookup, resource-group metadata, naming glossary) — the biggest unlock; turns the agent from "smart pattern-matcher over history" into one that resolves accounts history can't explain. Would reintroduce a bounded tool-calling loop alongside the current retrieval.
 - **Agent throughput/cost** — ~40% of rows are flagged; each agent investigation is a live LLM call, so the queue is capped per run. Batch/cache for full-batch enrichment.
-- **Persistence & concurrency** — the backend keeps batch state **in memory** and `commit_decisions` rewrites the Excel workbook; safe for one process / small team one-at-a-time. Moving both to a database (Postgres) is the next hardening step, and won't change the API contracts. This also unblocks running the backend with multiple `uvicorn --workers`.
+- **Persistence & concurrency** — the backend keeps batch state **in memory** and `commit_decisions` rewrites the Excel workbook; safe for one process / small team one-at-a-time. The target design (see **Roadmap** above) reads the master from **Databricks** (read-only) and moves *workflow* state to **Postgres**, making the container stateless; neither changes the API contracts, and it unblocks running the backend on multiple replicas.
