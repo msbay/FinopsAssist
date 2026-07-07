@@ -12,19 +12,24 @@ Per-provider models
 AWS and Azure accounts carry different clues, so we train ONE classifier per
 provider (see benchmark_v5.py):
   * Azure rows read the ResourceGroup + axa tags. AWS has no ResourceGroup.
-  * AWS rows additionally read the V5 enrichment columns (AwsAccountTags.owner /
+  * AWS rows read the V5 enrichment columns instead (AwsAccountTags.owner /
     global.dcs / local.description / name). These describe the account in plain
     text and are the decisive signal for the many AWS accounts whose
     SubAccountName is an opaque GUID. Per the data-owner requirement they are fed
-    ONLY to AWS rows; an Azure row never sees them.
+    ONLY to AWS rows; an Azure row never sees them. The shared axa tags are NOT
+    given to the AWS model — they are redundant with the AWS enrichment and add
+    nothing (benchmark: ±0.5pp) — so AWS reads its enrichment alone.
 On genuinely new accounts (group split by account) this scores ~87-88% on
 Recharging_Item_ID for each provider and ~94% on Product_Family — a ~4pp lift
 over one global model, and +18pp on AWS over name-only. The AWS tag columns use
 different names in the LEARNING and EMPTY sheets; AWS_TAG_SOURCES maps both.
 
-Rows the available clues cannot determine (an opaque/short name with no resource
-group or tags) are isolated up front via Review_Reason and always sent to review
-— see the error analysis for why.
+On Azure, rows the available clues cannot determine (an opaque/short name with no
+resource group or tags) are isolated up front via Review_Reason and always sent to
+review — name-only Azure rows are ~9pp less accurate, so the guard catches
+over-confident errors. AWS is exempt: its SubAccountNames are descriptive, so
+name-only AWS rows are as accurate as any (measured on V5), and AWS routes on
+confidence alone.
 """
 
 import re
@@ -32,6 +37,7 @@ from collections import Counter, defaultdict
 
 import numpy as np
 import pandas as pd
+from scipy.sparse import hstack
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 
@@ -75,11 +81,21 @@ AWS_TAG_SOURCES = {
 PROVIDER_AWS = "AWS"
 PROVIDER_AZURE = "AZURE"
 
-# Which fields (besides the name, which always leads the text) feed each bucket's
-# classifier. AWS gets the enrichment slots; Azure gets the ResourceGroup.
-_SHARED_CLUES = ("tag_dcs", "tag_app")
+# Fields (besides the name, which always leads the text) that feed each bucket's
+# classifier and count as routing evidence.
+_SHARED_CLUES = ("tag_dcs", "tag_app")      # axa_tags_global_dcs / _app
 _AZURE_EXTRA = ("resource_group",)
 _AWS_EXTRA = ("aws_owner", "aws_dcs", "aws_desc", "aws_name")
+
+# Per-bucket feature/clue fields. Azure reads the axa tags + ResourceGroup. AWS reads
+# ONLY its own enrichment — the shared axa tags are dropped for AWS because they are
+# redundant with the AWS enrichment (axa_tags_global_dcs ≈ AwsAccountTags.global.dcs)
+# and add nothing (benchmark: ±0.5pp, within noise). Azure has no enrichment, so it
+# still depends on the axa tags.
+_BUCKET_FIELDS = {
+    PROVIDER_AWS: _AWS_EXTRA,
+    PROVIDER_AZURE: _SHARED_CLUES + _AZURE_EXTRA,
+}
 
 
 def provider_bucket(raw) -> str:
@@ -89,7 +105,7 @@ def provider_bucket(raw) -> str:
 
 def _clue_keys(bucket: str) -> tuple[str, ...]:
     """Field keys that count as evidence (the name is judged separately)."""
-    return _SHARED_CLUES + (_AWS_EXTRA if bucket == PROVIDER_AWS else _AZURE_EXTRA)
+    return _BUCKET_FIELDS.get(bucket, _SHARED_CLUES + _AZURE_EXTRA)
 
 # Legacy (LIGHT_V2) column names -> canonical, so older workbooks still load. The old
 # LEARNING sheet used a "Custom.*" prefix and the EMPTY sheet a "focus_costs[...]" one;
@@ -146,6 +162,16 @@ def normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
 NGRAM_RANGE = (2, 4)
 CLF_C = 50.0
 
+# Azure ResourceGroup is the most specific identifier, but folded into one char-vector
+# with the SubAccountName + tags its features get IDF-diluted. So the Azure model gives
+# the RG its OWN vector, hstacked onto the context (name+tags) vector. This *separation*
+# is the win — +2pp on Azure Recharging_Item_ID (87.5 -> ~89.6%) — and it targets the
+# RG-discriminated confusions (OpenHosting 459/506, MPI 429/436, Shine 475/530). The
+# weight is a scale on the RG block: a sweep showed a flat 0.75-1.0 plateau (up-weighting
+# to ≥1.5 actually hurts, and repeating the RG text in one vector hurts more), so parity
+# (1.0) is the natural choice. AWS has no RG, so it keeps the single-vector featuriser.
+AZURE_RG_WEIGHT = 1.0
+
 # How many candidate ids to surface in Top_Matches — the tidy shortlist shown to
 # humans for audit/display.
 TOP_K_CANDIDATES = 5
@@ -196,28 +222,35 @@ _OPAQUE_NAME = re.compile(r"^[0-9a-f]{16,}$")
 def _evidence_reason(fields: dict, bucket: str) -> tuple[str, bool]:
     """Classify a row by the evidence available, for review routing.
 
-    Returns (reason, force_review). Most misses come from rows the clues simply
-    cannot determine — so we isolate those instead of letting them get a
-    confident-looking wrong guess. AWS rows count their enrichment tags as clues.
+    Returns (reason, force_review). The evidence guard (force a name-only / no-clue row
+    to review regardless of confidence) is AZURE-ONLY: on Azure, name-only rows are ~9pp
+    less accurate than rows with clues, so forcing them catches over-confident errors. On
+    AWS the SubAccountName is descriptive (e.g. go-sm-euc1-riskaissurance-prod) and
+    name-only rows are actually *more* accurate than rows with clues — so AWS never forces
+    review; confidence alone routes it (measured on V5, group split by account).
     """
     name = fields["name"]
+    guard = bucket == PROVIDER_AZURE  # only Azure force-routes on weak evidence
     has_clues = any(fields.get(k) for k in _clue_keys(bucket))
     if not has_clues:
         if _OPAQUE_NAME.match(name) or len(name) <= 6:
             # Bucket 1: opaque/short name, nothing else — not inferable.
-            return "no clue — opaque name, no resource group or tags; needs human", True
-        # Bucket 2: a plain name and nothing else — weak, unreliable.
-        return "weak — name only, no resource group or tags; low reliability", True
+            return "no clue — opaque name, no resource group or tags; needs human", guard
+        # Bucket 2: a plain name and nothing else — weak on Azure, reliable on AWS.
+        return "weak — name only, no resource group or tags; low reliability", guard
     # Bucket 3: has a resource group and/or tags — there is something to reason
     # over, so a borderline prediction is worth an LLM second opinion.
     return "check with LLM — has clues but name pattern is ambiguous", False
 
 
 def _no_signal(fields: dict, bucket: str) -> bool:
-    """True when a row carries NO learnable signal at all: an opaque/GUID (or empty)
-    SubAccountName AND no resource group / tags / (for AWS) enrichment. The recharging
-    id of such a row is not derivable from the data — it is isolated with *no
-    prediction*, rather than guessed. Applies only after exact-lookup fails."""
+    """True when an AZURE row carries NO learnable signal at all: an opaque/GUID (or empty)
+    SubAccountName AND no resource group / tags. Such a row's id is not derivable from the
+    data, so it is isolated with *no prediction* rather than guessed. AWS is exempt — its
+    names are descriptive enough that even name-only AWS rows predict reliably, so AWS rows
+    are always scored (see _evidence_reason). Applies only after exact-lookup fails."""
+    if bucket != PROVIDER_AZURE:
+        return False
     if any(fields.get(k) for k in _clue_keys(bucket)):
         return False
     name = fields["name"]
@@ -264,10 +297,45 @@ class RechargingMatcher:
 
     @staticmethod
     def _row_text(fields: dict, bucket: str) -> str:
-        """Single classifier string for a row: name | shared tags | provider extras
-        (blanks skipped). AWS rows include the enrichment slots; Azure the ResourceGroup."""
-        keys = ("name",) + _SHARED_CLUES + (_AWS_EXTRA if bucket == PROVIDER_AWS else _AZURE_EXTRA)
+        """Single classifier string for a row: name | provider fields (blanks skipped).
+        AWS uses its enrichment slots; Azure the axa tags + ResourceGroup."""
+        keys = ("name",) + _BUCKET_FIELDS.get(bucket, _SHARED_CLUES + _AZURE_EXTRA)
         return " | ".join(fields[k] for k in keys if fields.get(k))
+
+    @staticmethod
+    def _context_text(fields: dict) -> str:
+        """Azure context string WITHOUT the ResourceGroup (name + axa tags). The RG is
+        vectorised separately and up-weighted — see _fit_featurizer."""
+        keys = ("name",) + _SHARED_CLUES
+        return " | ".join(fields[k] for k in keys if fields.get(k))
+
+    # ------------------------------------------------------------------
+    # Featurization — one char-vector for AWS; context + weighted-RG for Azure
+    # ------------------------------------------------------------------
+    def _fit_featurizer(self, bucket: str, fields_list: list[dict]) -> tuple[dict, "object"]:
+        """Fit the vectoriser(s) for a bucket and return (model_parts, train_matrix).
+        Azure gets two char vectors (context + RG*AZURE_RG_WEIGHT) hstacked; AWS one."""
+        if bucket == PROVIDER_AZURE:
+            ctx = [self._context_text(f) for f in fields_list]
+            rg = [f["resource_group"] for f in fields_list]
+            vec_ctx = TfidfVectorizer(analyzer="char_wb", ngram_range=NGRAM_RANGE)
+            vec_rg = TfidfVectorizer(analyzer="char_wb", ngram_range=NGRAM_RANGE)
+            xc = vec_ctx.fit_transform(ctx)
+            xr = vec_rg.fit_transform(rg) * AZURE_RG_WEIGHT
+            return ({"vec_ctx": vec_ctx, "vec_rg": vec_rg, "rg_weight": AZURE_RG_WEIGHT},
+                    hstack([xc, xr]).tocsr())
+        texts = [self._row_text(f, bucket) for f in fields_list]
+        vec = TfidfVectorizer(analyzer="char_wb", ngram_range=NGRAM_RANGE)
+        return {"vec": vec}, vec.fit_transform(texts)
+
+    def _featurize(self, model: dict, bucket: str, fields_list: list[dict]):
+        """Transform rows to the feature matrix using a model's fitted vectoriser(s)."""
+        if "vec_rg" in model:  # Azure weighted-RG model
+            ctx = [self._context_text(f) for f in fields_list]
+            rg = [f["resource_group"] for f in fields_list]
+            return hstack([model["vec_ctx"].transform(ctx),
+                           model["vec_rg"].transform(rg) * model["rg_weight"]]).tocsr()
+        return model["vec"].transform([self._row_text(f, bucket) for f in fields_list])
 
     def _resolve_bucket(self, bucket: str) -> str | None:
         """The bucket whose model serves this row: its own if trained, else any
@@ -322,15 +390,16 @@ class RechargingMatcher:
             ids = np.array([self.ref_ids[i] for i in idxs])
             if len(set(ids)) < 2:  # LogisticRegression needs ≥2 classes; too sparse to model
                 continue
-            texts = [self._row_text(extracted[i][0], bucket) for i in idxs]
-            vec = TfidfVectorizer(analyzer="char_wb", ngram_range=NGRAM_RANGE)
+            fields_list = [extracted[i][0] for i in idxs]
+            model, x = self._fit_featurizer(bucket, fields_list)
             clf = LogisticRegression(max_iter=2000, C=CLF_C)
-            clf.fit(vec.fit_transform(texts), ids)
-            self.models[bucket] = {
-                "vec": vec, "clf": clf, "classes": clf.classes_,
+            clf.fit(x, ids)
+            model.update({
+                "clf": clf, "classes": clf.classes_,
                 "class_family": np.array([self.item_to_family.get(c, "") for c in clf.classes_]),
                 "class_product": np.array([self.item_to_product.get(c, "") for c in clf.classes_]),
-            }
+            })
+            self.models[bucket] = model
 
         print(f"Index built: {len(extracted)} items, {len(set(self.ref_ids))} unique IDs")
         print(f"  Hierarchy: {len(set(self.item_to_family.values()))} families, "
@@ -338,8 +407,10 @@ class RechargingMatcher:
         print(f"  Exact (name+RG) keys: {len(self.exact_lookup)}")
         print(f"  Safe name-only keys:  {len(self.name_lookup)}")
         for bucket, m in self.models.items():
+            feat = (f"context + RG×{m['rg_weight']} char {NGRAM_RANGE} n-grams"
+                    if "vec_rg" in m else f"char {NGRAM_RANGE} n-grams")
             print(f"  Classifier[{bucket}]: {len(by_bucket[bucket])} rows, "
-                  f"{len(m['classes'])} classes, char {NGRAM_RANGE} n-grams")
+                  f"{len(m['classes'])} classes, {feat}")
 
     # ------------------------------------------------------------------
     # Hierarchy helpers
@@ -406,8 +477,8 @@ class RechargingMatcher:
                 groups[rb].append(i)
         for rb, positions in groups.items():
             model = self.models[rb]
-            texts = [self._row_text(extracted[i][0], rb) for i in positions]
-            proba = model["clf"].predict_proba(model["vec"].transform(texts))
+            x = self._featurize(model, rb, [extracted[i][0] for i in positions])
+            proba = model["clf"].predict_proba(x)
             for j, i in enumerate(positions):
                 row_proba[i] = proba[j]
                 row_model[i] = model

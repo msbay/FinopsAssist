@@ -214,30 +214,70 @@ def _selected(event, rows):
     return [rows[p] for p in (event.selection.rows if event and event.selection else [])]
 
 
-def _approve_tab(bid):
-    rows = api_client.rows(bid, "approve")
-    if not rows:
-        st.success("Nothing awaiting approval right now. 🎉")
-        return
-    df = pd.DataFrame([{
+def _download_csv(df: pd.DataFrame, filename: str, key: str) -> None:
+    """A right-aligned 'Download CSV' button exporting the exact table shown above it."""
+    _, right = st.columns([3, 1])
+    right.download_button("⬇ Download CSV", df.to_csv(index=False).encode("utf-8"),
+                          file_name=filename, mime="text/csv", key=key, width="stretch")
+
+
+def _is_aws(r: dict) -> bool:
+    return "aws" in str(r.get("provider", "")).lower()
+
+
+def _provider_sections(rows: list[dict]):
+    """Split rows into per-provider sections (label, emoji, is_aws, key-suffix, subset),
+    each present only if it has rows — so AWS and Azure render as separate tables with
+    the columns that apply to each."""
+    aws = [r for r in rows if _is_aws(r)]
+    azure = [r for r in rows if not _is_aws(r)]
+    out = []
+    if aws:
+        out.append(("AWS", "☁️", True, "aws", aws))
+    if azure:
+        out.append(("Azure", "🔷", False, "azure", azure))
+    return out
+
+
+def _table_height(n: int) -> int:
+    """Fit the table to its rows (up to a cap), so stacked provider tables don't each
+    reserve a tall fixed pane."""
+    return min(460, 70 + 35 * n)
+
+
+def _approve_df(rows: list[dict], is_aws: bool) -> pd.DataFrame:
+    """Provider-relevant columns: AWS shows its enrichment (owner/name/dcs/description);
+    Azure shows ResourceGroup + axa tags."""
+    if is_aws:
+        return pd.DataFrame([{
+            "€ Cost": r["cost_eur"], "Recharging_Item_ID": r["predicted_recharging_item_id"],
+            "Confidence": r["confidence"], "Account": r["sub_account_name"],
+            "AWS name": r["aws_name"], "Owner": r["aws_owner"],
+            "dcs": r["aws_dcs"], "Description": r["aws_desc"],
+        } for r in rows])
+    return pd.DataFrame([{
         "€ Cost": r["cost_eur"], "Recharging_Item_ID": r["predicted_recharging_item_id"],
-        "Confidence": r["confidence"], "SubAccountName": r["sub_account_name"],
+        "Confidence": r["confidence"], "Subscription": r["sub_account_name"],
         "ResourceGroup": r["resource_group"], "dcs": r["tag_dcs"], "app": r["tag_app"],
     } for r in rows])
-    st.caption("**Select rows** with the checkboxes, then use the buttons below "
-               "(nothing is ever auto-approved — a human always confirms).")
+
+
+def _approve_block(bid, rows: list[dict], is_aws: bool, suffix: str) -> None:
+    df = _approve_df(rows, is_aws)
     event = st.dataframe(
         df.style.map(color_confidence, subset=["Confidence"]),
-        width="stretch", height=460, on_select="rerun", selection_mode="multi-row",
-        key="approve_table",
+        width="stretch", height=_table_height(len(rows)), on_select="rerun",
+        selection_mode="multi-row", key=f"approve_table_{suffix}",
         column_config={"€ Cost": st.column_config.NumberColumn(format="€%.0f"),
                        "Confidence": st.column_config.NumberColumn(format="%d")})
+    _download_csv(df, f"ready_to_approve_{suffix}.csv", f"dl_approve_{suffix}")
     sel = _selected(event, rows)
     n = len(sel)
     b1, b2, b3 = st.columns([1, 1, 2.2])
-    approve = b1.button(f"✓ Approve selected ({n})", type="primary",
-                        disabled=n == 0, width="stretch")
-    reject = b2.button(f"↩ Reject → send to review ({n})", disabled=n == 0, width="stretch")
+    approve = b1.button(f"✓ Approve selected ({n})", type="primary", disabled=n == 0,
+                        width="stretch", key=f"approve_btn_{suffix}")
+    reject = b2.button(f"↩ Reject → send to review ({n})", disabled=n == 0,
+                       width="stretch", key=f"reject_btn_{suffix}")
     b3.caption("**Approve** commits the predicted ID to the learning data (retrains next "
                "run). **Reject** moves the rows to the Review queue instead.")
     if approve and sel:
@@ -248,6 +288,19 @@ def _approve_tab(bid):
     if reject and sel:
         _do(lambda: api_client.reroute(bid, [r["row_id"] for r in sel]),
             f"Moved {n} row(s) to the Review queue.")
+
+
+def _approve_tab(bid):
+    rows = api_client.rows(bid, "approve")
+    if not rows:
+        st.success("Nothing awaiting approval right now. 🎉")
+        return
+    st.caption("**Select rows** with the checkboxes, then use the buttons below "
+               "(nothing is ever auto-approved — a human always confirms). AWS and Azure "
+               "are shown separately, each with the columns that apply.")
+    for label, emoji, is_aws, suffix, subset in _provider_sections(rows):
+        st.markdown(f"#### {emoji} {label} ({len(subset)})")
+        _approve_block(bid, subset, is_aws, suffix)
 
 
 @st.fragment(run_every=2)
@@ -266,6 +319,81 @@ def _review_progress(bid):
     st.caption("Runs on the server — you can keep working in the other tabs.")
 
 
+_REVIEW_COLCFG = {
+    "€ Cost": st.column_config.NumberColumn(format="€%.0f"),
+    "Agent confidence": st.column_config.NumberColumn(
+        "Agent conf.", format="%d",
+        help="The LLM's confidence after re-analyzing the row (blue scale)."),
+    "Classifier prediction": st.column_config.TextColumn(
+        "Classifier pred. (top-1)",
+        help="The classifier's own best guess, for comparison with the agent's."),
+    "Classifier confidence": st.column_config.NumberColumn(
+        "Classifier conf.", format="%d",
+        help="The classifier's score — this is what routed the row into Review "
+             "(below the approve threshold)."),
+    "Agent explanation": st.column_config.TextColumn(width="large"),
+    "Tokens": st.column_config.NumberColumn(
+        "Tokens", format="%d",
+        help="LLM tokens consumed analyzing this row (0 = handled without an "
+             "LLM call, e.g. no-signal rows)."),
+}
+
+
+def _review_df(rows: list[dict], is_aws: bool) -> pd.DataFrame:
+    """Provider-relevant evidence columns beside the agent/classifier predictions:
+    AWS shows owner/name/dcs/description; Azure shows ResourceGroup + axa tags."""
+    def common(r):
+        return {
+            "Agent prediction": r["agent_prediction"], "Agent confidence": r["agent_confidence"],
+            "Classifier prediction": r["predicted_recharging_item_id"],
+            "Classifier confidence": r["confidence"],
+            "Agent explanation": r["agent_explanation"], "Tokens": r.get("agent_tokens", 0),
+        }
+    if is_aws:
+        return pd.DataFrame([{
+            "€ Cost": r["cost_eur"], "Account": r["sub_account_name"],
+            "AWS name": r["aws_name"], "Owner": r["aws_owner"], "Description": r["aws_desc"],
+            "dcs": r["aws_dcs"], **common(r),
+        } for r in rows])
+    return pd.DataFrame([{
+        "€ Cost": r["cost_eur"], "Subscription": r["sub_account_name"],
+        "ResourceGroup": r["resource_group"], "dcs": r["tag_dcs"], "app": r["tag_app"],
+        **common(r),
+    } for r in rows])
+
+
+def _review_block(bid, rows: list[dict], is_aws: bool, suffix: str) -> None:
+    df = _review_df(rows, is_aws)
+    styler = (df.style
+              .map(color_agent, subset=["Agent confidence"])
+              .map(color_confidence, subset=["Classifier confidence"]))
+    event = st.dataframe(
+        styler, width="stretch", height=_table_height(len(rows)), on_select="rerun",
+        selection_mode="multi-row", key=f"review_table_{suffix}", column_config=_REVIEW_COLCFG)
+    _download_csv(df, f"review_queue_{suffix}.csv", f"dl_review_{suffix}")
+    sel = _selected(event, rows)
+    n = len(sel)
+    correction = st.text_input(
+        "Correct Recharging_Item_ID (for Reject & correct)", key=f"review_correction_{suffix}",
+        placeholder="e.g. PSO_ITM_9999").strip()
+    b1, b2, b3 = st.columns([1.2, 1.2, 2])
+    approve = b1.button(f"✓ Approve & commit ({n})", type="primary", disabled=n == 0,
+                        width="stretch", key=f"rev_approve_{suffix}")
+    reject = b2.button(f"✗ Reject & correct ({n})", disabled=(n == 0 or not correction),
+                       width="stretch", key=f"rev_reject_{suffix}")
+    b3.caption("**Approve** commits the agent's prediction. **Reject & correct** commits "
+               "the value typed above to the selected row(s) instead.")
+    if approve and sel:
+        _do(lambda: api_client.commit(
+            bid, [{"row_id": r["row_id"],
+                   "recharging_item_id": r["agent_prediction"]} for r in sel]),
+            f"Committed {n} row(s). Retrains next run.")
+    if reject and sel and correction:
+        _do(lambda: api_client.commit(
+            bid, [{"row_id": r["row_id"], "recharging_item_id": correction} for r in sel]),
+            f"Committed correction to {n} row(s). Retrains next run.")
+
+
 def _review_tab(bid, review_status):
     if review_status.get("running"):
         _review_progress(bid)
@@ -278,60 +406,11 @@ def _review_tab(bid, review_status):
         st.success("No rows to review. 🎉")
         return
     st.caption("The LLM analyzed the review rows. **Select** rows, then **Approve** the "
-               "agent's prediction — or **Reject & correct** with the value you type below.")
-    df = pd.DataFrame([{
-        "€ Cost": r["cost_eur"], "SubAccountName": r["sub_account_name"],
-        "ResourceGroup": r["resource_group"],
-        "Agent prediction": r["agent_prediction"], "Agent confidence": r["agent_confidence"],
-        "Classifier prediction": r["predicted_recharging_item_id"],
-        "Classifier confidence": r["confidence"],
-        "Agent explanation": r["agent_explanation"],
-        "Tokens": r.get("agent_tokens", 0),
-    } for r in rows])
-    styler = (df.style
-              .map(color_agent, subset=["Agent confidence"])
-              .map(color_confidence, subset=["Classifier confidence"]))
-    event = st.dataframe(
-        styler, width="stretch", height=460, on_select="rerun", selection_mode="multi-row",
-        key="review_table",
-        column_config={
-            "€ Cost": st.column_config.NumberColumn(format="€%.0f"),
-            "Agent confidence": st.column_config.NumberColumn(
-                "Agent conf.", format="%d",
-                help="The LLM's confidence after re-analyzing the row (blue scale)."),
-            "Classifier prediction": st.column_config.TextColumn(
-                "Classifier pred. (top-1)",
-                help="The classifier's own best guess, for comparison with the agent's."),
-            "Classifier confidence": st.column_config.NumberColumn(
-                "Classifier conf.", format="%d",
-                help="The classifier's score — this is what routed the row into Review "
-                     "(below the approve threshold)."),
-            "Agent explanation": st.column_config.TextColumn(width="large"),
-            "Tokens": st.column_config.NumberColumn(
-                "Tokens", format="%d",
-                help="LLM tokens consumed analyzing this row (0 = handled without an "
-                     "LLM call, e.g. no-signal rows).")})
-    sel = _selected(event, rows)
-    n = len(sel)
-    correction = st.text_input(
-        "Correct Recharging_Item_ID (for Reject & correct)", key="review_correction",
-        placeholder="e.g. PSO_ITM_9999").strip()
-    b1, b2, b3 = st.columns([1.2, 1.2, 2])
-    approve = b1.button(f"✓ Approve & commit ({n})", type="primary",
-                        disabled=n == 0, width="stretch")
-    reject = b2.button(f"✗ Reject & correct ({n})",
-                       disabled=(n == 0 or not correction), width="stretch")
-    b3.caption("**Approve** commits the agent's prediction. **Reject & correct** commits "
-               "the value typed above to the selected row(s) instead.")
-    if approve and sel:
-        _do(lambda: api_client.commit(
-            bid, [{"row_id": r["row_id"],
-                   "recharging_item_id": r["agent_prediction"]} for r in sel]),
-            f"Committed {n} row(s). Retrains next run.")
-    if reject and sel and correction:
-        _do(lambda: api_client.commit(
-            bid, [{"row_id": r["row_id"], "recharging_item_id": correction} for r in sel]),
-            f"Committed correction to {n} row(s). Retrains next run.")
+               "agent's prediction — or **Reject & correct** with the value you type below. "
+               "AWS and Azure are shown separately, each with the columns that apply.")
+    for label, emoji, is_aws, suffix, subset in _provider_sections(rows):
+        st.markdown(f"#### {emoji} {label} ({len(subset)})")
+        _review_block(bid, subset, is_aws, suffix)
 
 
 def _history_tab(bid, hist):

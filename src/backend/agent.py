@@ -91,23 +91,23 @@ def _retrieve_evidence(row: dict, k: int = 3) -> str:
 def _row_prompt(row: dict, cands: list[dict], evidence: str) -> str:
     # No inline hints here — the signal priorities live in SYSTEM_PROMPT, so repeating
     # them per row is wasted tokens. Just the facts + the candidates + the evidence.
-    # AWS enrichment lines appear only for AWS rows (blank on Azure).
-    aws_lines = ""
-    if any(row.get(k) for k in ("aws_owner", "aws_desc", "aws_name", "aws_dcs")):
-        aws_lines = (
-            f"  AWS account owner: {row.get('aws_owner', '')}\n"
-            f"  AWS account name: {row.get('aws_name', '')}\n"
-            f"  AWS dcs tag: {row.get('aws_dcs', '')}\n"
-            f"  AWS description: {row.get('aws_desc', '')}\n"
-        )
+    # Only non-empty fields are printed, so AWS rows (no ResourceGroup, and axa tags
+    # withheld) show their enrichment while Azure rows show their tags + ResourceGroup —
+    # each provider sees exactly the fields that apply to it, no empty label lines.
+    facts = [
+        ("Provider", row.get("provider", "")),
+        ("SubAccountName", row.get("name", "")),
+        ("ResourceGroup", row.get("resource_group", "")),
+        ("tag_dcs", row.get("tag_dcs", "")),
+        ("tag_app", row.get("tag_app", "")),
+        ("AWS account owner", row.get("aws_owner", "")),
+        ("AWS account name", row.get("aws_name", "")),
+        ("AWS dcs tag", row.get("aws_dcs", "")),
+        ("AWS description", row.get("aws_desc", "")),
+    ]
+    lines = "".join(f"  {label}: {value}\n" for label, value in facts if value)
     return (
-        "Resource to map:\n"
-        f"  Provider: {row.get('provider', '')}\n"
-        f"  SubAccountName: {row.get('name', '')}\n"
-        f"  ResourceGroup: {row.get('resource_group', '')}\n"
-        f"  tag_dcs: {row.get('tag_dcs', '')}\n"
-        f"  tag_app: {row.get('tag_app', '')}\n"
-        f"{aws_lines}\n"
+        f"Resource to map:\n{lines}\n"
         "Candidates (ranked by classifier p):\n"
         f"{_format_candidates(cands)}\n\n"
         f"{evidence}"

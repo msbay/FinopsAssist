@@ -18,10 +18,17 @@ import threading
 import uuid
 
 import pandas as pd
-from matcher import ACTION_AGENT, ACTION_APPROVE, EMPTY_COLS, RechargingMatcher
+from matcher import (
+    ACTION_AGENT,
+    ACTION_APPROVE,
+    EMPTY_COLS,
+    PROVIDER_AWS,
+    RechargingMatcher,
+)
 from review import (
     AGENT_COL_DEFAULTS,
     AUDIT_COLS,
+    MIN_LLM_COST_EUR,
     commit_decisions,
     recall_decision,
     run_review,
@@ -120,13 +127,24 @@ def _row_dict(idx, row: pd.Series) -> dict:
     def num(v) -> float:
         return float(pd.to_numeric(v, errors="coerce") or 0)
 
+    # Provider-aware fields so the frontend can show AWS vs Azure tables with the columns
+    # that actually apply. AWS enrichment (owner/dcs/description/name) comes from the
+    # matcher's extraction, which maps the LEARNING/EMPTY schema differences and is blank
+    # for Azure rows. The axa tags are withheld from AWS (mirroring the model).
+    fields, bucket = RechargingMatcher._extract(row, EMPTY_COLS)
+    is_aws = bucket == PROVIDER_AWS
     return {
         "row_id": int(idx),
         "cost_eur": num(row.get(EMPTY_COLS["cost"], 0)),
+        "provider": field("provider"),
         "sub_account_name": field("sub_account_name"),
-        "resource_group": field("resource_group"),
-        "tag_dcs": field("tag_dcs"),
-        "tag_app": field("tag_app"),
+        "resource_group": fields["resource_group"],
+        "tag_dcs": "" if is_aws else fields["tag_dcs"],
+        "tag_app": "" if is_aws else fields["tag_app"],
+        "aws_owner": fields["aws_owner"],
+        "aws_dcs": fields["aws_dcs"],
+        "aws_desc": fields["aws_desc"],
+        "aws_name": fields["aws_name"],
         "predicted_recharging_item_id": str(row.get("Predicted_Recharging_Item_ID", "") or ""),
         "confidence": num(row.get("Confidence", 0)),
         "suggested_action": str(row.get("Suggested_Action", "") or ""),
@@ -155,7 +173,11 @@ def start_review(batch_id: str) -> dict:
     is already running. Returns the current job status."""
     batch = get_batch(batch_id)
     r = batch.results
-    review_idx = r.index[r["Suggested_Action"] == ACTION_AGENT].tolist()
+    # Mirror run_review's cost floor so the job total / short-circuit match what the LLM
+    # will actually process (low-spend rows are left for a human, no LLM call).
+    cost = _cost(r)
+    review_idx = [i for i in r.index[r["Suggested_Action"] == ACTION_AGENT]
+                  if cost.at[i] > MIN_LLM_COST_EUR]
     if not review_idx:
         return review_status(batch_id)
     if batch.job and batch.job["running"]:

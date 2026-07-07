@@ -25,11 +25,16 @@ from matcher import (
     ACTION_AGENT,
     EMPTY_COLS,
     LEARNING_COLS,
+    PROVIDER_AWS,
     RechargingMatcher,
     normalize_schema,
 )
 
 LEARNING_SHEET = "GO_MAPPING_LEARNING"
+
+# Minimum € spend for a review row to be worth an LLM call. Rows at/below this are left
+# for a human (no agent suggestion) so tokens aren't spent investigating trivial spend.
+MIN_LLM_COST_EUR = 50.0
 
 
 def _row_to_agent_input(row: pd.Series) -> dict:
@@ -37,16 +42,18 @@ def _row_to_agent_input(row: pd.Series) -> dict:
 
     Uses the matcher's provider-aware extraction so AWS rows carry their V5 enrichment
     (owner / dcs / description / name) — the same fields the classifier sees — and Azure
-    rows do not.
+    rows do not. The shared axa tags are also withheld from AWS rows (blanked), so the
+    LLM sees exactly what the AWS classifier does; Azure still passes them.
     """
-    fields, _ = RechargingMatcher._extract(row, EMPTY_COLS)
+    fields, bucket = RechargingMatcher._extract(row, EMPTY_COLS)
+    is_aws = bucket == PROVIDER_AWS
     sub_id = str(row.get(EMPTY_COLS["sub_account_id"], "") or "").strip()
     return {
         "provider": str(row.get(EMPTY_COLS["provider"], "") or "").strip(),
         "name": fields["name"],
         "resource_group": fields["resource_group"],
-        "tag_dcs": fields["tag_dcs"],
-        "tag_app": fields["tag_app"],
+        "tag_dcs": "" if is_aws else fields["tag_dcs"],
+        "tag_app": "" if is_aws else fields["tag_app"],
         "sub_account_id": "" if sub_id.lower() == "nan" else sub_id,
         "aws_owner": fields["aws_owner"],
         "aws_dcs": fields["aws_dcs"],
@@ -119,11 +126,13 @@ def run_review(results: pd.DataFrame, matcher=None, agent: FinopsAssistant | Non
     if only_idx is not None:  # honour an explicit user selection, but stay within eligible
         eligible = eligible & out.index.isin(list(only_idx))
     review_idx = out.index[eligible].tolist()
-    # Prioritise by € spend: map the highest-cost eligible rows first, so a capped agent
-    # run (max_rows) spends its budget where the money is.
+    # Skip low-spend rows entirely: the LLM tokens aren't justified below MIN_LLM_COST_EUR.
+    # Such rows stay in the review queue for a human (no agent suggestion). Then prioritise
+    # the rest by € spend so a capped run (max_rows) spends its budget where the money is.
     cost_col = EMPTY_COLS["cost"]
     if cost_col in out.columns:
         cost = pd.to_numeric(out[cost_col], errors="coerce").fillna(0)
+        review_idx = [i for i in review_idx if cost.at[i] > MIN_LLM_COST_EUR]
         review_idx.sort(key=lambda i: cost.at[i], reverse=True)
     if max_rows is not None:
         review_idx = review_idx[:max_rows]

@@ -87,10 +87,17 @@ class BatchSummary(BaseModel):
 class Row(BaseModel):
     row_id: int
     cost_eur: float
+    provider: str = ""
     sub_account_name: str
     resource_group: str
     tag_dcs: str
     tag_app: str
+    # AWS enrichment (blank for Azure) — lets the frontend show AWS vs Azure tables with
+    # the columns that apply to each.
+    aws_owner: str = ""
+    aws_dcs: str = ""
+    aws_desc: str = ""
+    aws_name: str = ""
     predicted_recharging_item_id: str
     confidence: float
     suggested_action: str

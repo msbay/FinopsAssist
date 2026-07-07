@@ -8,6 +8,12 @@ it at another host with the FINOPS_API_URL env var.
 import os
 
 import httpx
+from dotenv import load_dotenv
+
+# Load .env so the frontend reads the SAME FINOPS_API_URL / FINOPS_API_TOKEN as the
+# backend (api.py also calls load_dotenv). Without this the Streamlit process would send
+# no token while the backend requires one -> 401. Real env vars still take precedence.
+load_dotenv()
 
 API_URL = os.environ.get("FINOPS_API_URL", "http://127.0.0.1:8000")
 # Service token for the backend (only enforced when the backend has FINOPS_API_TOKEN set).
