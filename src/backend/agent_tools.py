@@ -12,30 +12,31 @@ so the agent reasons from history alone for now.)
 from functools import lru_cache
 
 import pandas as pd
-from matcher import LEARNING_COLS, normalize_schema, trainable_rows
+from matcher import LEARNING_COLS, RechargingMatcher, normalize_schema, trainable_rows
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-INPUT_FILE = "GO Report Extract GROUPED_V3.xlsx"
+INPUT_FILE = "GO Report Extract GROUPED_V5.xlsx"
 
 
 @lru_cache(maxsize=1)
 def _reference_index():
-    """Lazily load GO_MAPPING_LEARNING and build a char n-gram index over row text."""
+    """Lazily load GO_MAPPING_LEARNING and build a char n-gram index over row text.
+
+    Row text reuses the matcher's provider-aware extraction, so AWS neighbours are
+    represented by their V5 enrichment (owner / description / name), not just the
+    (often opaque) SubAccountName — the same signal the classifier learns on.
+    """
     df = normalize_schema(pd.read_excel(INPUT_FILE, sheet_name="GO_MAPPING_LEARNING"))
     id_col = LEARNING_COLS["recharging_item_id"]
     df = trainable_rows(df, id_col)  # drop blank/XX_TOIDENTIFY placeholders
 
-    def field(row, key):
-        v = str(row.get(LEARNING_COLS[key], "") or "").lower().strip()
-        return "" if v == "nan" else v
-
     texts, rows = [], []
     for _, r in df.iterrows():
-        name, rg = field(r, "sub_account_name"), field(r, "resource_group")
-        dcs, app = field(r, "tag_dcs"), field(r, "tag_app")
-        texts.append(" | ".join(x for x in [name, rg, dcs, app] if x))
-        rows.append({"name": name, "resource_group": rg, "tag_dcs": dcs,
-                     "tag_app": app, "recharging_item_id": str(r[id_col])})
+        fields, bucket = RechargingMatcher._extract(r, LEARNING_COLS)
+        texts.append(RechargingMatcher._row_text(fields, bucket))
+        rows.append({"name": fields["name"], "resource_group": fields["resource_group"],
+                     "tag_dcs": fields["tag_dcs"], "tag_app": fields["tag_app"],
+                     "recharging_item_id": str(r[id_col])})
     vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4))
     return vec, vec.fit_transform(texts), rows
 
@@ -44,7 +45,8 @@ def find_similar_mappings(account_name: str, resource_group: str = "",
                           tags: str = "", k: int = 5) -> str:
     """The k historical accounts most similar to this one and the Recharging_Item_ID
     each was mapped to — evidence for how comparable resources were classified before.
-    Returns the top-k matches with a similarity score (0-1)."""
+    `tags` may carry any extra descriptive text (dcs/app tags, and for AWS the account
+    owner / description). Returns the top-k matches with a similarity score (0-1)."""
     vec, matrix, rows = _reference_index()
     query = " | ".join(x for x in [account_name.lower().strip(),
                                    resource_group.lower().strip(),

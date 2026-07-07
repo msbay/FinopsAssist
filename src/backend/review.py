@@ -25,6 +25,7 @@ from matcher import (
     ACTION_AGENT,
     EMPTY_COLS,
     LEARNING_COLS,
+    RechargingMatcher,
     normalize_schema,
 )
 
@@ -32,18 +33,25 @@ LEARNING_SHEET = "GO_MAPPING_LEARNING"
 
 
 def _row_to_agent_input(row: pd.Series) -> dict:
-    """Map a GO_MAPPING_EMPTY row to the dict shape FinopsAssistant.investigate wants."""
-    def field(col_key: str) -> str:
-        v = str(row.get(EMPTY_COLS[col_key], "") or "").strip()
-        return "" if v.lower() == "nan" else v
+    """Map a GO_MAPPING_EMPTY row to the dict shape FinopsAssistant.investigate wants.
 
+    Uses the matcher's provider-aware extraction so AWS rows carry their V5 enrichment
+    (owner / dcs / description / name) — the same fields the classifier sees — and Azure
+    rows do not.
+    """
+    fields, _ = RechargingMatcher._extract(row, EMPTY_COLS)
+    sub_id = str(row.get(EMPTY_COLS["sub_account_id"], "") or "").strip()
     return {
-        "provider": field("provider"),
-        "name": field("sub_account_name"),
-        "resource_group": field("resource_group"),
-        "tag_dcs": field("tag_dcs"),
-        "tag_app": field("tag_app"),
-        "sub_account_id": field("sub_account_id"),
+        "provider": str(row.get(EMPTY_COLS["provider"], "") or "").strip(),
+        "name": fields["name"],
+        "resource_group": fields["resource_group"],
+        "tag_dcs": fields["tag_dcs"],
+        "tag_app": fields["tag_app"],
+        "sub_account_id": "" if sub_id.lower() == "nan" else sub_id,
+        "aws_owner": fields["aws_owner"],
+        "aws_dcs": fields["aws_dcs"],
+        "aws_desc": fields["aws_desc"],
+        "aws_name": fields["aws_name"],
     }
 
 

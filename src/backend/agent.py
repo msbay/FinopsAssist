@@ -31,7 +31,8 @@ classifier was unsure — pick the best candidate.
 Signals, by priority:
 - Tags: `app` ≈ the Product, `dcs` ≈ the Product Family.
 - Azure: the ResourceGroup name is the most specific clue to the Item (e.g. "dynatrace" \
--> Dynatrace). AWS has no ResourceGroup — use the account name + tags.
+-> Dynatrace). AWS has no ResourceGroup — use the AWS account name / owner / description \
+enrichment (these identify accounts whose SubAccountName is an opaque GUID) plus the tags.
 - SubAccountName (AWS account / Azure subscription) is broad context only; one \
 subscription can hold several Items, so never map on it alone.
 - Similar historical mappings show how comparable resources were classified.
@@ -68,9 +69,18 @@ def _format_candidates(cands: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _aws_enrichment(row: dict) -> str:
+    """AWS-only descriptive text (owner / dcs / description / account name) for an AWS
+    row — the V5 enrichment that identifies accounts whose SubAccountName is a GUID.
+    Blank for Azure rows (which never carry these fields)."""
+    return " ".join(x for x in [row.get("aws_owner", ""), row.get("aws_dcs", ""),
+                                row.get("aws_desc", ""), row.get("aws_name", "")] if x)
+
+
 def _retrieve_evidence(row: dict, k: int = 3) -> str:
     """Deterministically fetch the k most similar historical mappings (no LLM call)."""
-    tags = " ".join(x for x in [row.get("tag_dcs", ""), row.get("tag_app", "")] if x)
+    tags = " ".join(x for x in [row.get("tag_dcs", ""), row.get("tag_app", ""),
+                                _aws_enrichment(row)] if x)
     try:
         return find_similar_mappings(account_name=row.get("name", ""),
                                      resource_group=row.get("resource_group", ""), tags=tags, k=k)
@@ -81,13 +91,23 @@ def _retrieve_evidence(row: dict, k: int = 3) -> str:
 def _row_prompt(row: dict, cands: list[dict], evidence: str) -> str:
     # No inline hints here — the signal priorities live in SYSTEM_PROMPT, so repeating
     # them per row is wasted tokens. Just the facts + the candidates + the evidence.
+    # AWS enrichment lines appear only for AWS rows (blank on Azure).
+    aws_lines = ""
+    if any(row.get(k) for k in ("aws_owner", "aws_desc", "aws_name", "aws_dcs")):
+        aws_lines = (
+            f"  AWS account owner: {row.get('aws_owner', '')}\n"
+            f"  AWS account name: {row.get('aws_name', '')}\n"
+            f"  AWS dcs tag: {row.get('aws_dcs', '')}\n"
+            f"  AWS description: {row.get('aws_desc', '')}\n"
+        )
     return (
         "Resource to map:\n"
         f"  Provider: {row.get('provider', '')}\n"
         f"  SubAccountName: {row.get('name', '')}\n"
         f"  ResourceGroup: {row.get('resource_group', '')}\n"
         f"  tag_dcs: {row.get('tag_dcs', '')}\n"
-        f"  tag_app: {row.get('tag_app', '')}\n\n"
+        f"  tag_app: {row.get('tag_app', '')}\n"
+        f"{aws_lines}\n"
         "Candidates (ranked by classifier p):\n"
         f"{_format_candidates(cands)}\n\n"
         f"{evidence}"

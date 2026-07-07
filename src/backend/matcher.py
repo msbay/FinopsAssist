@@ -7,24 +7,35 @@ Two layers, in order of cost:
      TF-IDF of the row text. Generalizes to genuinely new accounts and its
      predict_proba is a calibrated confidence.
 
-This is the configuration that won the benchmark (see benchmark.py): on
-genuinely new accounts (group split by account) it scores ~80% vs ~74% for the
-old hand-weighted fuzzy matcher, with better-calibrated confidence.
+Per-provider models
+-------------------
+AWS and Azure accounts carry different clues, so we train ONE classifier per
+provider (see benchmark_v5.py):
+  * Azure rows read the ResourceGroup + axa tags. AWS has no ResourceGroup.
+  * AWS rows additionally read the V5 enrichment columns (AwsAccountTags.owner /
+    global.dcs / local.description / name). These describe the account in plain
+    text and are the decisive signal for the many AWS accounts whose
+    SubAccountName is an opaque GUID. Per the data-owner requirement they are fed
+    ONLY to AWS rows; an Azure row never sees them.
+On genuinely new accounts (group split by account) this scores ~87-88% on
+Recharging_Item_ID for each provider and ~94% on Product_Family — a ~4pp lift
+over one global model, and +18pp on AWS over name-only. The AWS tag columns use
+different names in the LEARNING and EMPTY sheets; AWS_TAG_SOURCES maps both.
 
 Rows the available clues cannot determine (an opaque/short name with no resource
 group or tags) are isolated up front via Review_Reason and always sent to review
-— see the error analysis in benchmark.py for why.
+— see the error analysis for why.
 """
 
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 
 import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 
-# Canonical column names — the GROUPED_V3 schema, where both GO_MAPPING_LEARNING and
+# Canonical column names — the GROUPED_V3+ schema, where both GO_MAPPING_LEARNING and
 # GO_MAPPING_EMPTY share the same plain column names (no Custom.focus_costs[...] split).
 # Hierarchy labels: each Recharging_Item belongs to exactly one Product, which belongs
 # to (almost always) one Product_Family — predicted item -> Product/Family via the tree.
@@ -45,6 +56,40 @@ COLS = {
 # imports (review.py, app.py, run_pipeline.py, benchmark.py).
 LEARNING_COLS = COLS
 EMPTY_COLS = COLS
+
+# AWS-only enrichment (GROUPED_V5). Each canonical slot lists the source columns to try
+# in order — the LEARNING and EMPTY sheets name these differently:
+#   slot     LEARNING sheet                     EMPTY sheet
+#   aws_desc AwsAccountTags.local.description    AwsAccountTags.description
+#   aws_name AwsAccountTags.global.app          AwsAccountTags.name  (deanonymises GUIDs)
+# The first non-blank source wins; absent columns (e.g. V3 workbooks) are skipped.
+AWS_TAG_SOURCES = {
+    "aws_owner": ["AwsAccountTags.owner"],
+    "aws_dcs": ["AwsAccountTags.global.dcs"],
+    "aws_desc": ["AwsAccountTags.local.description", "AwsAccountTags.description"],
+    "aws_name": ["AwsAccountTags.global.app", "AwsAccountTags.name"],
+}
+
+# Provider buckets. One classifier per bucket; anything not AWS is treated as Azure
+# (Microsoft) — the shared/RG feature set has no AWS-only columns, so it never leaks them.
+PROVIDER_AWS = "AWS"
+PROVIDER_AZURE = "AZURE"
+
+# Which fields (besides the name, which always leads the text) feed each bucket's
+# classifier. AWS gets the enrichment slots; Azure gets the ResourceGroup.
+_SHARED_CLUES = ("tag_dcs", "tag_app")
+_AZURE_EXTRA = ("resource_group",)
+_AWS_EXTRA = ("aws_owner", "aws_dcs", "aws_desc", "aws_name")
+
+
+def provider_bucket(raw) -> str:
+    """Map a raw ProviderName to a model bucket ('AWS' or 'AZURE')."""
+    return PROVIDER_AWS if "aws" in str(raw or "").lower() else PROVIDER_AZURE
+
+
+def _clue_keys(bucket: str) -> tuple[str, ...]:
+    """Field keys that count as evidence (the name is judged separately)."""
+    return _SHARED_CLUES + (_AWS_EXTRA if bucket == PROVIDER_AWS else _AZURE_EXTRA)
 
 # Legacy (LIGHT_V2) column names -> canonical, so older workbooks still load. The old
 # LEARNING sheet used a "Custom.*" prefix and the EMPTY sheet a "focus_costs[...]" one;
@@ -77,7 +122,7 @@ _LEGACY_RENAME = {
 
 
 def normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename legacy LIGHT_V2 columns to the canonical V3 names. No-op on V3 files.
+    """Rename legacy LIGHT_V2 columns to the canonical V3 names. No-op on V3+ files.
 
     LIGHT_V2's LEARNING sheet carries redundant pairs (both `focus_costs[...]` and
     `Custom.focus_costs[...]`) that map to the same canonical name; after renaming we
@@ -95,9 +140,11 @@ def normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
         df = df.iloc[:, sorted(keep.values())]
     return df
 
-# Classifier hyper-parameters (tuned in benchmark.py)
+# Classifier hyper-parameters (tuned in benchmark_v5.py — char_wb(2,4)+LogReg C=50 is
+# the sweet spot; word n-grams / other classifiers don't beat it, and the lift comes
+# from the feature columns, not the model).
 NGRAM_RANGE = (2, 4)
-CLF_C = 50.0  # C=50 gives a free ~+1pp over the original C=10 on the benchmark
+CLF_C = 50.0
 
 # How many candidate ids to surface in Top_Matches — the tidy shortlist shown to
 # humans for audit/display.
@@ -105,10 +152,7 @@ TOP_K_CANDIDATES = 5
 
 # The agent gets a WIDER, high-recall candidate set (Candidate_IDs): take items by
 # descending probability until the cumulative mass reaches NUCLEUS_P, capped at
-# CANDIDATE_CAP. Adaptive — confident rows stay small, ambiguous ones widen. This
-# config lifts the review-row candidate ceiling to ~82% at ~8 candidates avg
-# (vs 60% at a flat top-5); presented as the Family>Product>Item tree it stays
-# navigable. Tuned in the candidate-set experiment.
+# CANDIDATE_CAP. Adaptive — confident rows stay small, ambiguous ones widen.
 NUCLEUS_P = 0.85
 CANDIDATE_CAP = 10
 
@@ -149,15 +193,15 @@ def trainable_rows(df: pd.DataFrame, id_col: str) -> pd.DataFrame:
 _OPAQUE_NAME = re.compile(r"^[0-9a-f]{16,}$")
 
 
-def _evidence_reason(fields: tuple) -> tuple[str, bool]:
+def _evidence_reason(fields: dict, bucket: str) -> tuple[str, bool]:
     """Classify a row by the evidence available, for review routing.
 
-    Returns (reason, force_review). The error analysis (see benchmark.py) showed
-    most misses come from rows the clues simply cannot determine — so we isolate
-    those instead of letting them get a confident-looking wrong guess.
+    Returns (reason, force_review). Most misses come from rows the clues simply
+    cannot determine — so we isolate those instead of letting them get a
+    confident-looking wrong guess. AWS rows count their enrichment tags as clues.
     """
-    name, rg, dcs, app = fields
-    has_clues = bool(rg) or bool(dcs) or bool(app)
+    name = fields["name"]
+    has_clues = any(fields.get(k) for k in _clue_keys(bucket))
     if not has_clues:
         if _OPAQUE_NAME.match(name) or len(name) <= 6:
             # Bucket 1: opaque/short name, nothing else — not inferable.
@@ -169,55 +213,71 @@ def _evidence_reason(fields: tuple) -> tuple[str, bool]:
     return "check with LLM — has clues but name pattern is ambiguous", False
 
 
-def _no_signal(fields: tuple) -> bool:
+def _no_signal(fields: dict, bucket: str) -> bool:
     """True when a row carries NO learnable signal at all: an opaque/GUID (or empty)
-    SubAccountName AND no resource group AND no tags. The recharging id of such a row
-    is not derivable from the data — it is isolated with *no prediction* (the answer
-    lives in owner/cloud knowledge, not in these fields), rather than guessed.
-    Applies only after exact-lookup fails: a previously-seen opaque id still resolves."""
-    name, rg, dcs, app = fields
-    if rg or dcs or app:
+    SubAccountName AND no resource group / tags / (for AWS) enrichment. The recharging
+    id of such a row is not derivable from the data — it is isolated with *no
+    prediction*, rather than guessed. Applies only after exact-lookup fails."""
+    if any(fields.get(k) for k in _clue_keys(bucket)):
         return False
+    name = fields["name"]
     return bool(_OPAQUE_NAME.match(name)) or name == ""
 
 
 class RechargingMatcher:
-    """Exact-lookup shortcut + char n-gram logistic-regression classifier."""
+    """Exact-lookup shortcut + per-provider char n-gram logistic-regression classifiers."""
 
     def __init__(self):
         self.ref_ids: list[str] = []
         self.exact_lookup: dict[tuple, str] = {}
         self.name_lookup: dict[str, str] = {}
-        self.vectorizer: TfidfVectorizer | None = None
-        self.clf: LogisticRegression | None = None
-        # Hierarchy: item id -> Product / Family / readable item name (majority vote),
-        # plus the Family/Product of each classifier class, aligned to clf.classes_,
-        # so we can marginalize the item probability vector up the tree.
+        # One trained model per provider bucket. Each entry:
+        #   {"vec", "clf", "classes", "class_family", "class_product"}
+        # where class_family/class_product are aligned to that clf's classes_ so the
+        # item probability vector can be marginalized up the tree.
+        self.models: dict[str, dict] = {}
+        # Hierarchy: item id -> Product / Family / readable item name (majority vote).
         self.item_to_family: dict[str, str] = {}
         self.item_to_product: dict[str, str] = {}
         self.item_to_name: dict[str, str] = {}
-        self.class_family: np.ndarray | None = None
-        self.class_product: np.ndarray | None = None
 
     # ------------------------------------------------------------------
     # Field extraction / text representation
     # ------------------------------------------------------------------
     @staticmethod
-    def _get_fields(row: pd.Series, cols: dict) -> tuple[str, str, str, str]:
-        """Extract and normalize the four text fields."""
-        vals = [str(row.get(cols[k], "") or "").lower().strip()
-                for k in ("sub_account_name", "resource_group", "tag_dcs", "tag_app")]
-        name = vals[0]
-        rg, dcs, app = ("" if v == "nan" else v for v in vals[1:])
-        return name, rg, dcs, app
+    def _extract(row: pd.Series, cols: dict) -> tuple[dict, str]:
+        """Normalized text fields for a row (as a dict) plus its provider bucket.
+        AWS enrichment slots read from whichever source column is present/non-blank."""
+        def one(colname: str) -> str:
+            v = str(row.get(colname, "") or "").lower().strip()
+            return "" if v == "nan" else v
+
+        fields = {
+            "name": one(cols["sub_account_name"]),
+            "resource_group": one(cols["resource_group"]),
+            "tag_dcs": one(cols["tag_dcs"]),
+            "tag_app": one(cols["tag_app"]),
+        }
+        for slot, sources in AWS_TAG_SOURCES.items():
+            fields[slot] = next((v for v in (one(s) for s in sources) if v), "")
+        return fields, provider_bucket(row.get(cols["provider"], ""))
 
     @staticmethod
-    def _to_text(fields: tuple) -> str:
-        """Single string for the classifier: name | rg | dcs | app (skip blanks)."""
-        return " | ".join(f for f in fields if f)
+    def _row_text(fields: dict, bucket: str) -> str:
+        """Single classifier string for a row: name | shared tags | provider extras
+        (blanks skipped). AWS rows include the enrichment slots; Azure the ResourceGroup."""
+        keys = ("name",) + _SHARED_CLUES + (_AWS_EXTRA if bucket == PROVIDER_AWS else _AZURE_EXTRA)
+        return " | ".join(fields[k] for k in keys if fields.get(k))
+
+    def _resolve_bucket(self, bucket: str) -> str | None:
+        """The bucket whose model serves this row: its own if trained, else any
+        available model (fallback for a provider unseen in training)."""
+        if bucket in self.models:
+            return bucket
+        return next(iter(self.models), None)
 
     # ------------------------------------------------------------------
-    # Index building (exact lookups + train classifier)
+    # Index building (exact lookups + train per-provider classifiers)
     # ------------------------------------------------------------------
     def build_index(self, df_learning: pd.DataFrame) -> None:
         df_learning = normalize_schema(df_learning)
@@ -225,22 +285,22 @@ class RechargingMatcher:
         # Drop blank/placeholder (XX_TOIDENTIFY) targets — never learn them as a class.
         df_clean = trainable_rows(df_learning, id_col)
 
-        ref_fields = [self._get_fields(row, LEARNING_COLS) for _, row in df_clean.iterrows()]
+        extracted = [self._extract(row, LEARNING_COLS) for _, row in df_clean.iterrows()]
         self.ref_ids = df_clean[id_col].astype(str).tolist()
 
-        # Exact (name, rg) → majority ID
+        # Exact (name, rg) → majority ID  (global; rg is blank for AWS, so key is name-only there)
         key_ids: dict[tuple, list[str]] = {}
-        for fields, rid in zip(ref_fields, self.ref_ids):
-            key_ids.setdefault((fields[0], fields[1]), []).append(rid)
+        for (fields, _), rid in zip(extracted, self.ref_ids):
+            key_ids.setdefault((fields["name"], fields["resource_group"]), []).append(rid)
         self.exact_lookup = {k: Counter(v).most_common(1)[0][0] for k, v in key_ids.items()}
 
         # Name-only → ID, but only when the name is unambiguous
         name_ids: dict[str, set[str]] = {}
-        for fields, rid in zip(ref_fields, self.ref_ids):
-            name_ids.setdefault(fields[0], set()).add(rid)
+        for (fields, _), rid in zip(extracted, self.ref_ids):
+            name_ids.setdefault(fields["name"], set()).add(rid)
         self.name_lookup = {n: ids.pop() for n, ids in name_ids.items() if len(ids) == 1}
 
-        # Learn the hierarchy: item id -> majority Product / Family / readable name.
+        # Learn the hierarchy (global): item id -> majority Product / Family / readable name.
         def majority(col_key: str) -> dict[str, str]:
             if col_key not in df_clean.columns:
                 return {}
@@ -253,23 +313,33 @@ class RechargingMatcher:
         self.item_to_product = majority(LEARNING_COLS["product_name"])
         self.item_to_name = majority(LEARNING_COLS["recharging_item_name"])
 
-        # Train the classifier on the row text
-        texts = [self._to_text(f) for f in ref_fields]
-        self.vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=NGRAM_RANGE)
-        x = self.vectorizer.fit_transform(texts)
-        self.clf = LogisticRegression(max_iter=2000, C=CLF_C)
-        self.clf.fit(x, np.array(self.ref_ids))
+        # Train one classifier per provider bucket, each over its own feature layout.
+        self.models = {}
+        by_bucket: dict[str, list[int]] = defaultdict(list)
+        for i, (_, bucket) in enumerate(extracted):
+            by_bucket[bucket].append(i)
+        for bucket, idxs in by_bucket.items():
+            ids = np.array([self.ref_ids[i] for i in idxs])
+            if len(set(ids)) < 2:  # LogisticRegression needs ≥2 classes; too sparse to model
+                continue
+            texts = [self._row_text(extracted[i][0], bucket) for i in idxs]
+            vec = TfidfVectorizer(analyzer="char_wb", ngram_range=NGRAM_RANGE)
+            clf = LogisticRegression(max_iter=2000, C=CLF_C)
+            clf.fit(vec.fit_transform(texts), ids)
+            self.models[bucket] = {
+                "vec": vec, "clf": clf, "classes": clf.classes_,
+                "class_family": np.array([self.item_to_family.get(c, "") for c in clf.classes_]),
+                "class_product": np.array([self.item_to_product.get(c, "") for c in clf.classes_]),
+            }
 
-        # Family/Product of each class, aligned to clf.classes_, for marginalization.
-        self.class_family = np.array([self.item_to_family.get(c, "") for c in self.clf.classes_])
-        self.class_product = np.array([self.item_to_product.get(c, "") for c in self.clf.classes_])
-
-        print(f"Index built: {len(ref_fields)} items, {len(set(self.ref_ids))} unique IDs")
+        print(f"Index built: {len(extracted)} items, {len(set(self.ref_ids))} unique IDs")
         print(f"  Hierarchy: {len(set(self.item_to_family.values()))} families, "
               f"{len(set(self.item_to_product.values()))} products, {len(set(self.ref_ids))} items")
         print(f"  Exact (name+RG) keys: {len(self.exact_lookup)}")
         print(f"  Safe name-only keys:  {len(self.name_lookup)}")
-        print(f"  Classifier: LogReg over char {NGRAM_RANGE} n-grams")
+        for bucket, m in self.models.items():
+            print(f"  Classifier[{bucket}]: {len(by_bucket[bucket])} rows, "
+                  f"{len(m['classes'])} classes, char {NGRAM_RANGE} n-grams")
 
     # ------------------------------------------------------------------
     # Hierarchy helpers
@@ -280,18 +350,18 @@ class RechargingMatcher:
                 self.item_to_product.get(item_id, ""),
                 self.item_to_name.get(item_id, item_id))
 
-    def _level_confidence(self, row_proba: np.ndarray, item_id: str) -> tuple[float, float]:
-        """Marginalize the item probability vector up the tree:
-        Family_conf = Σ P(item) over items in the predicted item's family; likewise Product.
-        Coarser levels aggregate more mass, so confidence rises up the tree — and is
-        always consistent with the chosen item."""
+    def _level_confidence(self, row_proba: np.ndarray, item_id: str, class_family: np.ndarray,
+                          class_product: np.ndarray) -> tuple[float, float]:
+        """Marginalize the item probability vector (aligned to one model's classes) up the
+        tree: Family_conf = Σ P(item) over items in the predicted item's family; likewise
+        Product. Coarser levels aggregate more mass, so confidence rises up the tree — and
+        is always consistent with the chosen item."""
         fam, prod, _ = self._ancestry(item_id)
-        fam_mask = self.class_family == fam
-        # Nest the product strictly inside the predicted family. Most items map to a
-        # single (product, family) pair, but the placeholder product
-        # "(IT own Cloud consumption)" holds the XX_* catch-all items across many
-        # families — nesting keeps Family_conf >= Product_conf >= Item_conf always.
-        prod_mask = fam_mask & (self.class_product == prod)
+        fam_mask = class_family == fam
+        # Nest the product strictly inside the predicted family, so
+        # Family_conf >= Product_conf >= Item_conf always (the placeholder product
+        # "(IT own Cloud consumption)" holds XX_* catch-all items across many families).
+        prod_mask = fam_mask & (class_product == prod)
         fam_conf = round(float(row_proba[fam_mask].sum() * 100), 1) if fam else 0.0
         prod_conf = round(float(row_proba[prod_mask].sum() * 100), 1) if prod else 0.0
         return fam_conf, prod_conf
@@ -309,30 +379,43 @@ class RechargingMatcher:
     # ------------------------------------------------------------------
     # Predict
     # ------------------------------------------------------------------
-    def predict(self, df_empty: pd.DataFrame, confidence_threshold: float = 50.0) -> pd.DataFrame:
-        """Predict Recharging_Item_ID for each row in GO_MAPPING_EMPTY.
+    def predict(self, df_empty: pd.DataFrame, confidence_threshold: float = 60.0) -> pd.DataFrame:
+        """Predict Recharging_Item_ID for each row in GO_MAPPING_EMPTY, routing each row
+        to its provider's classifier.
 
         Adds columns:
-        - Predicted_Recharging_Item_ID
-        - Confidence (0-100; classifier probability, or 100/95 for exact matches)
-        - Top_Matches (top-K candidates for audit; K = TOP_K_CANDIDATES)
-        - Needs_Review (Confidence < threshold, OR a no-clue / name-only row)
-        - Match_Method (exact_name_rg, exact_name, classifier)
-        - Review_Reason (why a row is flagged: no clue / weak / check with LLM)
+        - Predicted_Recharging_Item_ID / _Name, Predicted_Product_Family / _Name
+        - Confidence + Family_Confidence + Product_Confidence (0-100)
+        - Top_Matches, Candidate_IDs (audit / agent shortlists)
+        - Needs_Review, Match_Method, Review_Reason, Suggested_Action
         """
-        if self.clf is None or self.vectorizer is None:
+        if not self.models:
             raise RuntimeError("build_index() must be called before predict()")
 
         df_empty = normalize_schema(df_empty)
-        empty_fields = [self._get_fields(row, EMPTY_COLS) for _, row in df_empty.iterrows()]
-        # Batch the classifier over every row at once.
-        proba = self.clf.predict_proba(
-            self.vectorizer.transform([self._to_text(f) for f in empty_fields]))
-        classes = self.clf.classes_
+        extracted = [self._extract(row, EMPTY_COLS) for _, row in df_empty.iterrows()]
+
+        # Batch the classifier per model: group row positions by the model that serves them.
+        n = len(extracted)
+        row_proba: list[np.ndarray | None] = [None] * n
+        row_model: list[dict | None] = [None] * n
+        groups: dict[str, list[int]] = defaultdict(list)
+        for i, (_, bucket) in enumerate(extracted):
+            rb = self._resolve_bucket(bucket)
+            if rb is not None:
+                groups[rb].append(i)
+        for rb, positions in groups.items():
+            model = self.models[rb]
+            texts = [self._row_text(extracted[i][0], rb) for i in positions]
+            proba = model["clf"].predict_proba(model["vec"].transform(texts))
+            for j, i in enumerate(positions):
+                row_proba[i] = proba[j]
+                row_model[i] = model
 
         results = []
-        for q_fields, row_proba in zip(empty_fields, proba):
-            exact_key = (q_fields[0], q_fields[1])
+        for i, (fields, bucket) in enumerate(extracted):
+            name, rg = fields["name"], fields["resource_group"]
+            exact_key = (name, rg)
             if exact_key in self.exact_lookup:
                 pred = self.exact_lookup[exact_key]
                 fam, prod, item_name = self._ancestry(pred)
@@ -350,8 +433,8 @@ class RechargingMatcher:
                 })
                 continue
 
-            if q_fields[0] in self.name_lookup:
-                pred = self.name_lookup[q_fields[0]]
+            if name in self.name_lookup:
+                pred = self.name_lookup[name]
                 fam, prod, item_name = self._ancestry(pred)
                 results.append({
                     "Predicted_Product_Family": fam, "Family_Confidence": 95.0,
@@ -367,9 +450,9 @@ class RechargingMatcher:
                 })
                 continue
 
-            # No signal at all (opaque/empty name, no rg, no tags) -> do NOT guess.
-            # Isolate with an empty prediction; the answer needs owner/cloud knowledge.
-            if _no_signal(q_fields):
+            # No signal at all (opaque/empty name, no rg, no tags/enrichment) -> do NOT
+            # guess. Isolate with an empty prediction; the answer needs owner knowledge.
+            if _no_signal(fields, bucket):
                 results.append({
                     "Predicted_Product_Family": "", "Family_Confidence": 0.0,
                     "Predicted_Product_Name": "", "Product_Confidence": 0.0,
@@ -381,18 +464,21 @@ class RechargingMatcher:
                 })
                 continue
 
-            order = np.argsort(row_proba)[::-1]
+            model, proba = row_model[i], row_proba[i]
+            classes = model["classes"]
+            order = np.argsort(proba)[::-1]
             pred = classes[order[0]]
-            confidence = round(float(row_proba[order[0]] * 100), 1)
-            top_matches = " | ".join(f"{classes[j]} ({row_proba[j]:.2f})"
+            confidence = round(float(proba[order[0]] * 100), 1)
+            top_matches = " | ".join(f"{classes[j]} ({proba[j]:.2f})"
                                      for j in order[:TOP_K_CANDIDATES])
             candidate_ids = " | ".join(f"{cid} ({p:.2f})"
-                                       for cid, p in self._nucleus_candidates(row_proba, classes))
+                                       for cid, p in self._nucleus_candidates(proba, classes))
             fam, prod, item_name = self._ancestry(pred)
-            fam_conf, prod_conf = self._level_confidence(row_proba, pred)
+            fam_conf, prod_conf = self._level_confidence(
+                proba, pred, model["class_family"], model["class_product"])
             # Route by available evidence: isolate the rows the clues cannot
             # determine (no clue / name-only) even if the classifier looks confident.
-            reason, force_review = _evidence_reason(q_fields)
+            reason, force_review = _evidence_reason(fields, bucket)
             needs_review = bool(force_review or confidence < confidence_threshold)
             results.append({
                 "Predicted_Product_Family": fam, "Family_Confidence": fam_conf,

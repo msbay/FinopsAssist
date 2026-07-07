@@ -27,8 +27,13 @@ from review import (
     run_review,
 )
 
-WORKBOOK = "GO Report Extract GROUPED_V3.xlsx"
-APPROVE_THRESHOLD = 50.0
+WORKBOOK = "GO Report Extract GROUPED_V5.xlsx"
+# Confidence at/above which a row is auto-routed to human approval on the classifier's
+# top-1; below it the row goes to Review, where the LLM re-analyses it and its pick
+# becomes the suggested answer. Raised 50 -> 60 from the threshold sweep: the 50-60 band
+# is only ~50-67% accurate for both providers (risky to auto-approve) and is exactly where
+# the LLM beats the classifier top-1, so those rows are worth an LLM second opinion.
+APPROVE_THRESHOLD = 60.0
 ACTION_DONE = "Approved ✓"
 
 
