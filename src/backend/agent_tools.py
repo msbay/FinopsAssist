@@ -18,6 +18,15 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 INPUT_FILE = "GO Report Extract GROUPED_V5.xlsx"
 
 
+def _load_learning_df() -> pd.DataFrame:
+    """Load GO_MAPPING_LEARNING from Databricks if configured, else from the Excel file."""
+    try:
+        from data_source import fetch_learning
+        return fetch_learning()
+    except Exception:
+        return normalize_schema(pd.read_excel(INPUT_FILE, sheet_name="GO_MAPPING_LEARNING"))
+
+
 @lru_cache(maxsize=1)
 def _reference_index():
     """Lazily load GO_MAPPING_LEARNING and build a char n-gram index over row text.
@@ -26,7 +35,7 @@ def _reference_index():
     represented by their V5 enrichment (owner / description / name), not just the
     (often opaque) SubAccountName — the same signal the classifier learns on.
     """
-    df = normalize_schema(pd.read_excel(INPUT_FILE, sheet_name="GO_MAPPING_LEARNING"))
+    df = _load_learning_df()
     id_col = LEARNING_COLS["recharging_item_id"]
     df = trainable_rows(df, id_col)  # drop blank/XX_TOIDENTIFY placeholders
 

@@ -14,6 +14,7 @@ State is an in-memory dict of batches for now. Phase 1 replaces `_BATCHES` and t
 """
 
 import io
+import logging
 import threading
 import uuid
 
@@ -34,7 +35,12 @@ from review import (
     run_review,
 )
 
+logger = logging.getLogger("finops.service")
+
 WORKBOOK = "GO Report Extract GROUPED_V5.xlsx"
+# Use Databricks as the data source instead of the Excel workbook when available.
+# Falls back to the Excel file when Databricks is not configured.
+USE_DATABRICKS = True
 # Confidence at/above which a row is auto-routed to human approval on the classifier's
 # top-1; below it the row goes to Review, where the LLM re-analyses it and its pick
 # becomes the suggested answer. Raised 50 -> 60 from the threshold sweep: the 50-60 band
@@ -66,15 +72,39 @@ def _cost(df: pd.DataFrame) -> pd.Series:
     return pd.Series(0.0, index=df.index)
 
 
+def _load_from_databricks():
+    """Load learning and empty DataFrames from Databricks in a single fetch."""
+    from data_source import fetch_learning_and_empty
+    return fetch_learning_and_empty()
+
+
 def run_batch(learning_bytes: bytes | None = None, empty_bytes: bytes | None = None) -> str:
     """Train the matcher on GO_MAPPING_LEARNING and predict GO_MAPPING_EMPTY. Returns a
-    new batch_id. With no uploaded bytes, uses the bundled workbook."""
-    lsrc = io.BytesIO(learning_bytes) if learning_bytes else WORKBOOK
-    esrc = io.BytesIO(empty_bytes) if empty_bytes else WORKBOOK
+    new batch_id. With no uploaded bytes, uses Databricks (if configured) or the bundled
+    workbook as fallback."""
+    if learning_bytes or empty_bytes:
+        # Explicit upload overrides Databricks
+        lsrc = io.BytesIO(learning_bytes) if learning_bytes else WORKBOOK
+        esrc = io.BytesIO(empty_bytes) if empty_bytes else WORKBOOK
+        df_learning = pd.read_excel(lsrc, sheet_name="GO_MAPPING_LEARNING")
+        df_empty = pd.read_excel(esrc, sheet_name="GO_MAPPING_EMPTY")
+    elif USE_DATABRICKS:
+        try:
+            logger.info("Loading data from Databricks...")
+            df_learning, df_empty = _load_from_databricks()
+            logger.info("Databricks: %d learning rows, %d empty rows",
+                        len(df_learning), len(df_empty))
+        except Exception as e:
+            logger.warning("Databricks unavailable (%s), falling back to Excel", e)
+            df_learning = pd.read_excel(WORKBOOK, sheet_name="GO_MAPPING_LEARNING")
+            df_empty = pd.read_excel(WORKBOOK, sheet_name="GO_MAPPING_EMPTY")
+    else:
+        df_learning = pd.read_excel(WORKBOOK, sheet_name="GO_MAPPING_LEARNING")
+        df_empty = pd.read_excel(WORKBOOK, sheet_name="GO_MAPPING_EMPTY")
+
     matcher = RechargingMatcher()
-    matcher.build_index(pd.read_excel(lsrc, sheet_name="GO_MAPPING_LEARNING"))
-    results = matcher.predict(pd.read_excel(esrc, sheet_name="GO_MAPPING_EMPTY"),
-                              confidence_threshold=APPROVE_THRESHOLD)
+    matcher.build_index(df_learning)
+    results = matcher.predict(df_empty, confidence_threshold=APPROVE_THRESHOLD)
     # Seed empty agent columns so review rows are describable before the LLM runs.
     for col, default in AGENT_COL_DEFAULTS.items():
         results[col] = pd.Series([default] * len(results), index=results.index, dtype=object)
