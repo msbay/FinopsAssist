@@ -37,7 +37,7 @@ from collections import Counter, defaultdict
 
 import numpy as np
 import pandas as pd
-from scipy.sparse import hstack
+from scipy.sparse import diags, hstack
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 
@@ -171,6 +171,19 @@ CLF_C = 50.0
 # to ≥1.5 actually hurts, and repeating the RG text in one vector hurts more), so parity
 # (1.0) is the natural choice. AWS has no RG, so it keeps the single-vector featuriser.
 AZURE_RG_WEIGHT = 1.0
+
+# Not every RG is discriminative: the auto-created 'networkwatcherrg' (in every
+# subscription) maps to 13+ different items, and shared infra RGs are similar. Feeding
+# those at full strength biases the RG vector toward whatever the RG was most often in
+# training, overriding the informative SubAccountName. So instead of a hardcoded blocklist
+# we SELF-TUNE: each RG's vector is scaled by its reliability = 1 / (#distinct items it
+# mapped to in training). A clean RG (1 item) keeps weight 1.0; 'networkwatcherrg' (13
+# items) fades to ~0.08, so the row leans on the name. Unseen RGs default to full trust; a
+# small regex also zeroes per-instance auto-created RGs (e.g. AKS 'MC_*') that are each
+# seen once so the data can't flag them. Recovers ~+8pp on the affected rows. Exact
+# (name, RG) lookup is untouched — a *seen* generic-RG row still resolves exactly.
+GENERIC_RG_RE = re.compile(r"^mc_|cloud-shell-storage|defaultresourcegroup|"
+                           r"^databricks-rg|^az-ago-mgmt|log-analytics-default", re.I)
 
 # How many candidate ids to surface in Top_Matches — the tidy shortlist shown to
 # humans for audit/display.
@@ -312,29 +325,51 @@ class RechargingMatcher:
     # ------------------------------------------------------------------
     # Featurization — one char-vector for AWS; context + weighted-RG for Azure
     # ------------------------------------------------------------------
-    def _fit_featurizer(self, bucket: str, fields_list: list[dict]) -> tuple[dict, "object"]:
-        """Fit the vectoriser(s) for a bucket and return (model_parts, train_matrix).
-        Azure gets two char vectors (context + RG*AZURE_RG_WEIGHT) hstacked; AWS one."""
+    @staticmethod
+    def _rg_reliability(rg: str, rg_label_counts: dict) -> float:
+        """How much to trust a RG as a signal: 1/(#distinct items it mapped to in training).
+        Blank/regex-generic -> 0; unseen -> 1.0 (trust it); 'networkwatcherrg' -> ~0.08."""
+        if not rg or GENERIC_RG_RE.search(rg):
+            return 0.0
+        k = rg_label_counts.get(rg)
+        return 1.0 if k is None else 1.0 / k
+
+    def _rg_block(self, vec_rg, fields_list, rg_label_counts):
+        """RG char-vector with each row scaled by AZURE_RG_WEIGHT × its RG reliability, so
+        non-discriminative RGs fade and the row leans on the SubAccountName."""
+        rg = [f["resource_group"] for f in fields_list]
+        w = np.array([AZURE_RG_WEIGHT * self._rg_reliability(r, rg_label_counts) for r in rg])
+        return diags(w) @ vec_rg.transform(rg)
+
+    def _fit_featurizer(self, bucket: str, fields_list: list[dict],
+                        ids: np.ndarray) -> tuple[dict, "object"]:
+        """Fit the vectoriser(s) for a bucket and return (model_parts, train_matrix). Azure
+        gets two char vectors (context + reliability-weighted RG) hstacked; AWS one."""
         if bucket == PROVIDER_AZURE:
-            ctx = [self._context_text(f) for f in fields_list]
-            rg = [f["resource_group"] for f in fields_list]
+            # How many distinct items each RG maps to in training -> its reliability weight.
+            rg_label_counts: dict[str, set] = defaultdict(set)
+            for f, rid in zip(fields_list, ids):
+                if f["resource_group"]:
+                    rg_label_counts[f["resource_group"]].add(rid)
+            rg_label_counts = {r: len(s) for r, s in rg_label_counts.items()}
             vec_ctx = TfidfVectorizer(analyzer="char_wb", ngram_range=NGRAM_RANGE)
             vec_rg = TfidfVectorizer(analyzer="char_wb", ngram_range=NGRAM_RANGE)
-            xc = vec_ctx.fit_transform(ctx)
-            xr = vec_rg.fit_transform(rg) * AZURE_RG_WEIGHT
-            return ({"vec_ctx": vec_ctx, "vec_rg": vec_rg, "rg_weight": AZURE_RG_WEIGHT},
-                    hstack([xc, xr]).tocsr())
+            vec_rg.fit([f["resource_group"] for f in fields_list])
+            xc = vec_ctx.fit_transform([self._context_text(f) for f in fields_list])
+            xr = self._rg_block(vec_rg, fields_list, rg_label_counts)
+            model = {"vec_ctx": vec_ctx, "vec_rg": vec_rg, "rg_weight": AZURE_RG_WEIGHT,
+                     "rg_label_counts": rg_label_counts}
+            return model, hstack([xc, xr]).tocsr()
         texts = [self._row_text(f, bucket) for f in fields_list]
         vec = TfidfVectorizer(analyzer="char_wb", ngram_range=NGRAM_RANGE)
         return {"vec": vec}, vec.fit_transform(texts)
 
     def _featurize(self, model: dict, bucket: str, fields_list: list[dict]):
         """Transform rows to the feature matrix using a model's fitted vectoriser(s)."""
-        if "vec_rg" in model:  # Azure weighted-RG model
-            ctx = [self._context_text(f) for f in fields_list]
-            rg = [f["resource_group"] for f in fields_list]
-            return hstack([model["vec_ctx"].transform(ctx),
-                           model["vec_rg"].transform(rg) * model["rg_weight"]]).tocsr()
+        if "vec_rg" in model:  # Azure context + reliability-weighted RG model
+            xc = model["vec_ctx"].transform([self._context_text(f) for f in fields_list])
+            xr = self._rg_block(model["vec_rg"], fields_list, model["rg_label_counts"])
+            return hstack([xc, xr]).tocsr()
         return model["vec"].transform([self._row_text(f, bucket) for f in fields_list])
 
     def _resolve_bucket(self, bucket: str) -> str | None:
@@ -391,7 +426,7 @@ class RechargingMatcher:
             if len(set(ids)) < 2:  # LogisticRegression needs ≥2 classes; too sparse to model
                 continue
             fields_list = [extracted[i][0] for i in idxs]
-            model, x = self._fit_featurizer(bucket, fields_list)
+            model, x = self._fit_featurizer(bucket, fields_list, ids)
             clf = LogisticRegression(max_iter=2000, C=CLF_C)
             clf.fit(x, ids)
             model.update({
@@ -407,7 +442,7 @@ class RechargingMatcher:
         print(f"  Exact (name+RG) keys: {len(self.exact_lookup)}")
         print(f"  Safe name-only keys:  {len(self.name_lookup)}")
         for bucket, m in self.models.items():
-            feat = (f"context + RG×{m['rg_weight']} char {NGRAM_RANGE} n-grams"
+            feat = (f"context + reliability-weighted RG char {NGRAM_RANGE} n-grams"
                     if "vec_rg" in m else f"char {NGRAM_RANGE} n-grams")
             print(f"  Classifier[{bucket}]: {len(by_bucket[bucket])} rows, "
                   f"{len(m['classes'])} classes, {feat}")
