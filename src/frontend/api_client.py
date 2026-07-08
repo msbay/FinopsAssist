@@ -18,7 +18,6 @@ load_dotenv()
 API_URL = os.environ.get("FINOPS_API_URL", "http://127.0.0.1:8000")
 # Service token for the backend (only enforced when the backend has FINOPS_API_TOKEN set).
 API_TOKEN = os.environ.get("FINOPS_API_TOKEN")
-_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 _auth = {"Authorization": f"Bearer {API_TOKEN}"} if API_TOKEN else {}
 _client = httpx.Client(base_url=API_URL, timeout=300, headers=_auth)
 
@@ -28,10 +27,9 @@ def _json(resp: httpx.Response):
     return resp.json()
 
 
-def run_batch(file_bytes: bytes | None = None) -> dict:
-    """Train + predict. Optional uploaded .xlsx bytes; else the server's bundled workbook."""
-    files = {"file": ("batch.xlsx", file_bytes, _XLSX)} if file_bytes else None
-    return _json(_client.post("/batches", files=files))
+def run_batch() -> dict:
+    """Train + predict, pulling data directly from Databricks + the AWS accounts API."""
+    return _json(_client.post("/batches"))
 
 
 def summary(batch_id: str) -> dict:

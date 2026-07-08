@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import service
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 # Load .env so it configures the backend in local dev (prod injects real env vars, which
@@ -146,12 +146,11 @@ def health() -> dict:
 
 
 @app.post("/batches", response_model=BatchSummary, status_code=201)
-async def create_batch(file: UploadFile | None = File(default=None)) -> dict:
-    """Run the pipeline: train on history + predict this month's accounts. Optionally
-    upload an .xlsx (with GO_MAPPING_LEARNING + GO_MAPPING_EMPTY); otherwise the bundled
-    workbook is used. Returns the new batch summary."""
-    data = await file.read() if file else None
-    batch_id = service.run_batch(learning_bytes=data, empty_bytes=data)
+def create_batch() -> dict:
+    """Run the pipeline: pull this month's accounts + history from Databricks (enriched
+    with the AWS accounts API), train on history and predict the unmapped rows. Returns
+    the new batch summary."""
+    batch_id = service.run_batch()
     return service.summary(batch_id)
 
 

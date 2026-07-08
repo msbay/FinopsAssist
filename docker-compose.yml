@@ -9,11 +9,13 @@ services:
     image: finops-backend
     environment:
       FINOPS_API_TOKEN: ${FINOPS_API_TOKEN:-local-dev-token}
+      LEARNING_STORE_PATH: /app/data/learning_store.csv
     env_file:
-      - .env                      # AWS/Bedrock creds for the LLM agent (train+predict works without)
+      - .env                      # Databricks/Azure SPN + AWS accounts API + Bedrock creds
     volumes:
-      # the learning store lives OUTSIDE the container — commits persist to your host file
-      - "./GO Report Extract GROUPED_V3.xlsx:/app/GO Report Extract GROUPED_V3.xlsx"
+      # the learning store (approved decisions) lives OUTSIDE the container — commits
+      # persist to your host ./data dir across restarts
+      - "./data:/app/data"
     ports:
       - "8000:8000"               # exposed for local debugging (/docs); keep internal in prod
 

@@ -20,3 +20,5 @@ build/
 # Generated / transient data artifacts
 GO_predictions.xlsx
 *.xlsx
+# Local feedback store (approved decisions) — may hold account data
+learning_store.csv

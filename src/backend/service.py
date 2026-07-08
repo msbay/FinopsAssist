@@ -9,11 +9,10 @@ do in-session now lives server-side:
     start_review → analyse the review rows with the LLM (background thread, polled)
     commit       → append confirmed decisions to the learning store (feedback loop)
 
-State is an in-memory dict of batches for now. Phase 1 replaces `_BATCHES` and the Excel
-`commit_decisions` write with a database — the route/signature contracts stay the same.
+State is an in-memory dict of batches for now. Phase 1 replaces `_BATCHES` and the local
+`commit_decisions` store with a database — the route/signature contracts stay the same.
 """
 
-import io
 import logging
 import threading
 import uuid
@@ -28,19 +27,13 @@ from matcher import (
 )
 from review import (
     AGENT_COL_DEFAULTS,
-    AUDIT_COLS,
     MIN_LLM_COST_EUR,
-    commit_decisions,
     recall_decision,
     run_review,
 )
 
 logger = logging.getLogger("finops.service")
 
-WORKBOOK = "GO Report Extract GROUPED_V5.xlsx"
-# Use Databricks as the data source instead of the Excel workbook when available.
-# Falls back to the Excel file when Databricks is not configured.
-USE_DATABRICKS = True
 # Confidence at/above which a row is auto-routed to human approval on the classifier's
 # top-1; below it the row goes to Review, where the LLM re-analyses it and its pick
 # becomes the suggested answer. Raised 50 -> 60 from the threshold sweep: the 50-60 band
@@ -72,35 +65,19 @@ def _cost(df: pd.DataFrame) -> pd.Series:
     return pd.Series(0.0, index=df.index)
 
 
-def _load_from_databricks():
-    """Load learning and empty DataFrames from Databricks in a single fetch."""
+def run_batch() -> str:
+    """Train the matcher on the learning rows and predict the empty rows, pulling both
+    directly from Databricks (enriched with AWS account tags from the Postgres aws_accounts
+    table and merged with the local learning store). Returns a new batch_id."""
+    logger.info("Loading data from Databricks...")
+    import agent_tools
     from data_source import fetch_learning_and_empty
-    return fetch_learning_and_empty()
-
-
-def run_batch(learning_bytes: bytes | None = None, empty_bytes: bytes | None = None) -> str:
-    """Train the matcher on GO_MAPPING_LEARNING and predict GO_MAPPING_EMPTY. Returns a
-    new batch_id. With no uploaded bytes, uses Databricks (if configured) or the bundled
-    workbook as fallback."""
-    if learning_bytes or empty_bytes:
-        # Explicit upload overrides Databricks
-        lsrc = io.BytesIO(learning_bytes) if learning_bytes else WORKBOOK
-        esrc = io.BytesIO(empty_bytes) if empty_bytes else WORKBOOK
-        df_learning = pd.read_excel(lsrc, sheet_name="GO_MAPPING_LEARNING")
-        df_empty = pd.read_excel(esrc, sheet_name="GO_MAPPING_EMPTY")
-    elif USE_DATABRICKS:
-        try:
-            logger.info("Loading data from Databricks...")
-            df_learning, df_empty = _load_from_databricks()
-            logger.info("Databricks: %d learning rows, %d empty rows",
-                        len(df_learning), len(df_empty))
-        except Exception as e:
-            logger.warning("Databricks unavailable (%s), falling back to Excel", e)
-            df_learning = pd.read_excel(WORKBOOK, sheet_name="GO_MAPPING_LEARNING")
-            df_empty = pd.read_excel(WORKBOOK, sheet_name="GO_MAPPING_EMPTY")
-    else:
-        df_learning = pd.read_excel(WORKBOOK, sheet_name="GO_MAPPING_LEARNING")
-        df_empty = pd.read_excel(WORKBOOK, sheet_name="GO_MAPPING_EMPTY")
+    df_learning, df_empty = fetch_learning_and_empty()
+    logger.info("Databricks: %d learning rows, %d empty rows",
+                len(df_learning), len(df_empty))
+    # Hand the freshly-pulled learning frame to the LLM review's similarity index so it
+    # rebuilds from this run's data without a second Databricks/AWS pull.
+    agent_tools.set_learning_df(df_learning)
 
     matcher = RechargingMatcher()
     matcher.build_index(df_learning)
@@ -234,35 +211,12 @@ def start_review(batch_id: str) -> dict:
 
 
 def commit(batch_id: str, decisions: list[dict], reviewed_by: str = "api") -> dict:
-    """Commit confirmed (row_id -> recharging_item_id) decisions: append to the learning
-    store, mark the rows done, and record them for history/recall. `decisions` items:
-    {"row_id": int, "recharging_item_id": str}."""
-    batch = get_batch(batch_id)
-    with batch.lock:
-        r = batch.results
-        pending = []  # (idx, row, rid, prev_action, prev_review)
-        for d in decisions:
-            idx, rid = d.get("row_id"), str(d.get("recharging_item_id", "") or "").strip()
-            if idx in r.index and rid:
-                pending.append((idx, r.loc[idx], rid,
-                                str(r.at[idx, "Suggested_Action"]),
-                                bool(r.at[idx, "Needs_Review"])))
-        records = commit_decisions([(row, rid) for _, row, rid, _, _ in pending],
-                                   reviewed_by, WORKBOOK)
-        for (idx, row, rid, prev_action, prev_review), rec in zip(pending, records):
-            r.at[idx, "Predicted_Recharging_Item_ID"] = rid
-            r.at[idx, "Needs_Review"] = False
-            r.at[idx, "Suggested_Action"] = ACTION_DONE
-            batch.approvals.append({
-                "approval_id": uuid.uuid4().hex[:12],
-                "row_id": int(idx),
-                "name": str(row.get(EMPTY_COLS["sub_account_name"], f"row {idx}") or f"row {idx}"),
-                "recharging_item_id": rid,
-                "reviewed_at": rec.get(AUDIT_COLS["reviewed_at"], ""),
-                "source": rec.get(AUDIT_COLS["source"], ""),
-                "record": rec, "prev_action": prev_action, "prev_review": prev_review,
-            })
-    return {"committed": len(records), "skipped": len(decisions) - len(records)}
+    """Committing is DISABLED for now — the pipeline output is download-only (CSV). This
+    is a deliberate no-op: nothing is appended to the learning store, no row is marked
+    done, and no history entry is recorded. The route/frontend contract is kept stable so
+    it can be re-enabled by restoring the persistence body (see git history)."""
+    get_batch(batch_id)  # preserve the 404-on-unknown-batch contract
+    return {"committed": 0, "skipped": len(decisions)}
 
 
 def reroute(batch_id: str, row_ids: list[int]) -> dict:
@@ -296,7 +250,7 @@ def recall(batch_id: str, approval_id: str) -> dict:
         if pos is None:
             raise KeyError(approval_id)
         appr = batch.approvals.pop(pos)
-        removed = recall_decision(WORKBOOK, appr["record"])
+        removed = recall_decision(appr["record"])
         idx = appr["row_id"]
         if idx in batch.results.index:
             batch.results.at[idx, "Needs_Review"] = appr["prev_review"]

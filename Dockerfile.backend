@@ -17,7 +17,7 @@ COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 COPY src/backend ./src/backend
 
-# OpenShift-friendly: an arbitrary non-root UID (group 0) must write the workbook + .BACKUP.
+# OpenShift-friendly: an arbitrary non-root UID (group 0) must write the learning store.
 RUN chown -R 1001:0 /app && chmod -R g+rwX /app
 USER 1001
 
@@ -25,5 +25,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=10s --timeout=3s --retries=12 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
 
-# Bind 0.0.0.0; workbook path resolves against WORKDIR /app.
+# Bind 0.0.0.0; the learning store path resolves against WORKDIR /app.
 CMD ["uvicorn", "api:app", "--app-dir", "src/backend", "--host", "0.0.0.0", "--port", "8000"]

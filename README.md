@@ -295,17 +295,27 @@ AWS_SECRET_ACCESS_KEY=<your-secret-access-key>
 
 ## Run
 
-Two processes, both started **from the project root** (so the workbook path resolves). Start
-the backend first:
+Two processes, both started **from the project root** (so the learning-store path resolves).
+Start the backend first:
 
 ```bash
 uvicorn api:app --app-dir src/backend            # backend  → http://127.0.0.1:8000  (docs at /docs)
 streamlit run src/frontend/app.py                # frontend → http://localhost:8501
 ```
 
+- **AWS account enrichment source.** By default the backend reads AWS account tags directly from Postgres (`DB_*` / `DATABASE_URL`). To use the exposed HTTP API instead — e.g. from the corporate network — set the source on the same command line (uvicorn doesn't forward custom flags, so it's an env var; identical to setting it in an OpenShift Deployment `env:`):
+  ```bash
+  # Use the API with the built-in default corporate URL:
+  AWS_ACCOUNTS_SOURCE=api uvicorn api:app --app-dir src/backend
+
+  # …or point at an explicit URL (also selects API mode):
+  AWS_ACCOUNTS_API_URL=https://finops-backend.ago-fr-dev-int.merlot.eu-central-1.aws.openpaas.axa-cloud.com/data/aws-accounts \
+    uvicorn api:app --app-dir src/backend
+  ```
+  No arg → DB. Startup logs show which ran (`AWS accounts DB: N accounts loaded` vs `AWS accounts API: N accounts loaded`). Either way it's best-effort: if the source is unreachable, AWS rows keep empty enrichment and the run continues.
 - While developing, use `uvicorn api:app --app-dir src/backend --reload --reload-dir src/backend`. The `--reload-dir src/backend` is important — **without it the reloader watches the whole tree including `.venv`**, which loops endlessly on large packages and never starts. For just *running* the app, omit `--reload`.
 - Point the UI at a remote backend with `FINOPS_API_URL=http://host:8000 streamlit run src/frontend/app.py`.
-- Bedrock connectivity check: `python src/backend/main.py`.
+- Databricks connectivity check: `python src/backend/data_source.py`. Bedrock check: `python src/backend/main.py`.
 
 The backend needs valid Bedrock credentials in `.env`; without them the classifier still
 runs and the review queue can be filled in manually (the LLM step surfaces a warning).

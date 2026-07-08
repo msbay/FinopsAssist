@@ -6,8 +6,8 @@ review. This module:
   1. run_review        — runs FinopsAssistant over the Needs_Review rows only,
      attaching the agent's proposal/evidence as new columns.
   2. commit_decisions  — appends human-confirmed (row -> Recharging_Item_ID) mappings
-     to GO_MAPPING_LEARNING with an audit stamp, so the next pipeline run retrains on
-     them. This is what makes the system improve each cycle.
+     to the local learning store (learning_store.py) with an audit stamp, so the next
+     pipeline run retrains on them. This is what makes the system improve each cycle.
   3. recall_decision   — undoes a committed decision.
 
 No function here ever auto-writes a Recharging_Item_ID into the prediction output —
@@ -15,10 +15,9 @@ a human Accept/Override is always the trigger for a commit.
 """
 
 import re
-import shutil
 from datetime import datetime, timezone
-from pathlib import Path
 
+import learning_store
 import pandas as pd
 from agent import FinopsAssistant
 from matcher import (
@@ -27,10 +26,7 @@ from matcher import (
     LEARNING_COLS,
     PROVIDER_AWS,
     RechargingMatcher,
-    normalize_schema,
 )
-
-LEARNING_SHEET = "GO_MAPPING_LEARNING"
 
 # Minimum € spend for a review row to be worth an LLM call. Rows at/below this are left
 # for a human (no agent suggestion) so tokens aren't spent investigating trivial spend.
@@ -177,14 +173,10 @@ def run_review(results: pd.DataFrame, matcher=None, agent: FinopsAssistant | Non
     return out
 
 
-# ── Feedback loop: commit a confirmed decision back to the learning data ──────
-AUDIT_COLS = {"reviewed_by": "Reviewed_By", "reviewed_at": "Reviewed_At",
-              "source": "Review_Source"}
-
-
+# ── Feedback loop: commit a confirmed decision to the local learning store ────
 def _learning_record(row: pd.Series, recharging_item_id: str, reviewed_by: str,
                      source: str, at: str) -> dict:
-    """One GO_MAPPING_LEARNING row (canonical columns) for a confirmed decision."""
+    """One learning-store row (canonical columns + audit stamp) for a confirmed decision."""
     return {
         LEARNING_COLS["sub_account_name"]: str(row.get(EMPTY_COLS["sub_account_name"], "") or ""),
         LEARNING_COLS["sub_account_id"]: str(row.get(EMPTY_COLS["sub_account_id"], "") or ""),
@@ -192,65 +184,33 @@ def _learning_record(row: pd.Series, recharging_item_id: str, reviewed_by: str,
         LEARNING_COLS["tag_dcs"]: str(row.get(EMPTY_COLS["tag_dcs"], "") or ""),
         LEARNING_COLS["tag_app"]: str(row.get(EMPTY_COLS["tag_app"], "") or ""),
         LEARNING_COLS["recharging_item_id"]: recharging_item_id,
-        AUDIT_COLS["reviewed_by"]: reviewed_by,
-        AUDIT_COLS["reviewed_at"]: at,
-        AUDIT_COLS["source"]: source,
+        learning_store.REVIEWED_BY: reviewed_by,
+        learning_store.REVIEWED_AT: at,
+        learning_store.REVIEW_SOURCE: source,
     }
 
 
-def _write_sheets(workbook: Path, sheets: dict) -> None:
-    with pd.ExcelWriter(workbook, engine="openpyxl") as writer:
-        for name, df in sheets.items():
-            df.to_excel(writer, sheet_name=name, index=False)
-
-
-def commit_decisions(decisions, reviewed_by: str, workbook: str,
+def commit_decisions(decisions, reviewed_by: str,
                      source: str = "human_review") -> list[dict]:
-    """Append several confirmed (row -> Recharging_Item_ID) mappings to
-    GO_MAPPING_LEARNING in a SINGLE workbook write (for dashboard batch-approve).
+    """Append several confirmed (row -> Recharging_Item_ID) mappings to the local
+    learning store (learning_store.py) in a single write (for dashboard batch-approve).
 
     `decisions` is an iterable of (row: pd.Series, recharging_item_id: str). Rows with a
-    blank id are skipped (nothing to learn). A one-time .BACKUP is made; audit columns
-    record who/when/how; all other sheets are preserved verbatim. Returns the list of
-    appended learning records (each carries the Reviewed_At stamp used to recall it).
+    blank id are skipped (nothing to learn). Audit columns record who/when/how. Returns
+    the list of appended learning records (each carries the Reviewed_At stamp used to
+    recall it). The next fetch_learning_and_empty() merges these onto the Databricks
+    learning rows, so the model retrains on them.
     """
     records, at = [], datetime.now(timezone.utc).isoformat(timespec="seconds")
     for row, rid in decisions:
         rid = str(rid or "").strip()
         if rid:
             records.append(_learning_record(row, rid, reviewed_by, source, at))
-    if not records:
-        return []
-
-    wb = Path(workbook)
-    backup = wb.with_suffix(".BACKUP" + wb.suffix)
-    if not backup.exists():
-        shutil.copy2(wb, backup)
-
-    sheets = pd.read_excel(wb, sheet_name=None)
-    # Normalize to canonical names so the appended rows' columns align (no-op on V3).
-    sheets[LEARNING_SHEET] = normalize_schema(sheets[LEARNING_SHEET])
-    sheets[LEARNING_SHEET] = pd.concat(
-        [sheets[LEARNING_SHEET], pd.DataFrame(records)], ignore_index=True)
-    _write_sheets(wb, sheets)
-    return records
+    return learning_store.append(records)
 
 
-def recall_decision(workbook: str, record: dict) -> bool:
-    """Undo a previously committed decision: remove the matching row from
-    GO_MAPPING_LEARNING (identified by its audit stamp + id + account). Removes at most
-    one row and returns whether a match was found. Other sheets are preserved verbatim.
-    """
-    wb = Path(workbook)
-    sheets = pd.read_excel(wb, sheet_name=None)
-    learning = normalize_schema(sheets[LEARNING_SHEET])
-    mask = pd.Series(True, index=learning.index)
-    for col in (AUDIT_COLS["reviewed_at"], AUDIT_COLS["reviewed_by"],
-                LEARNING_COLS["recharging_item_id"], LEARNING_COLS["sub_account_name"]):
-        if col in learning.columns:
-            mask &= learning[col].astype(str) == str(record.get(col, ""))
-    if not mask.any():
-        return False
-    sheets[LEARNING_SHEET] = learning.drop(index=learning.index[mask][0]).reset_index(drop=True)
-    _write_sheets(wb, sheets)
-    return True
+def recall_decision(record: dict) -> bool:
+    """Undo a previously committed decision: remove the matching row from the learning
+    store (identified by its audit stamp + id + account). Removes at most one row and
+    returns whether a match was found."""
+    return learning_store.remove(record)

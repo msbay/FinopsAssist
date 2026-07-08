@@ -1,7 +1,7 @@
 """Retrieval evidence for the enrichment agent.
 
-`find_similar_mappings` retrieves real historical rows from GO_MAPPING_LEARNING —
-concrete, read-only evidence the agent reasons over. It never writes a
+`find_similar_mappings` retrieves real historical learning rows (from Databricks, via
+data_source) — concrete, read-only evidence the agent reasons over. It never writes a
 Recharging_Item_ID.
 
 (Cloud / CMDB / wiki enrichment — looking up a subscription's owner or what a naming
@@ -12,24 +12,26 @@ so the agent reasons from history alone for now.)
 from functools import lru_cache
 
 import pandas as pd
-from matcher import LEARNING_COLS, RechargingMatcher, normalize_schema, trainable_rows
+from matcher import LEARNING_COLS, RechargingMatcher, trainable_rows
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-INPUT_FILE = "GO Report Extract GROUPED_V5.xlsx"
+# The pipeline seeds the learning frame it already pulled here (set_learning_df), so the
+# reference index reuses it instead of doing a second Databricks/AWS round-trip.
+_LEARNING_DF: pd.DataFrame | None = None
 
 
 def _load_learning_df() -> pd.DataFrame:
-    """Load GO_MAPPING_LEARNING from Databricks if configured, else from the Excel file."""
-    try:
-        from data_source import fetch_learning
-        return fetch_learning()
-    except Exception:
-        return normalize_schema(pd.read_excel(INPUT_FILE, sheet_name="GO_MAPPING_LEARNING"))
+    """The learning rows: the frame the current run already seeded if present, else pulled
+    fresh from Databricks (enriched + merged with the local store)."""
+    if _LEARNING_DF is not None:
+        return _LEARNING_DF
+    from data_source import fetch_learning
+    return fetch_learning()
 
 
 @lru_cache(maxsize=1)
 def _reference_index():
-    """Lazily load GO_MAPPING_LEARNING and build a char n-gram index over row text.
+    """Lazily load the learning rows and build a char n-gram index over row text.
 
     Row text reuses the matcher's provider-aware extraction, so AWS neighbours are
     represented by their V5 enrichment (owner / description / name), not just the
@@ -48,6 +50,17 @@ def _reference_index():
                      "recharging_item_id": str(r[id_col])})
     vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4))
     return vec, vec.fit_transform(texts), rows
+
+
+def set_learning_df(df: pd.DataFrame) -> None:
+    """Seed the reference index from an already-fetched learning frame and drop the cached
+    index so the next lookup rebuilds from it. Called at the start of each pipeline run:
+    it both refreshes the index (otherwise memoised for the whole process, leaving the LLM's
+    similarity evidence stuck on the first run's data) AND avoids a second Databricks/AWS
+    pull for data the run just loaded."""
+    global _LEARNING_DF
+    _LEARNING_DF = df
+    _reference_index.cache_clear()
 
 
 def find_similar_mappings(account_name: str, resource_group: str = "",

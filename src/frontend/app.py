@@ -142,14 +142,12 @@ def _how_it_works_dialog():
 def cost_allocation_page():
     with st.sidebar:
         st.header("Data source")
-        upload = st.file_uploader(
-            "Upload a GO billing report",
-            type=["xlsx"])
+        st.caption("Data is pulled directly from Databricks and the AWS accounts API — "
+                   "no upload needed.")
         if st.button("Run pipeline", type="primary", width="stretch"):
-            with st.spinner("Training & predicting on the server…"):
+            with st.spinner("Pulling data, training & predicting on the server…"):
                 try:
-                    data = upload.getvalue() if upload else None
-                    summary = api_client.run_batch(data)
+                    summary = api_client.run_batch()
                     st.session_state.batch_id = summary["batch_id"]
                     api_client.start_review(summary["batch_id"])  # LLM runs on the server
                 except Exception as e:  # noqa: BLE001
@@ -166,7 +164,8 @@ def cost_allocation_page():
 
     bid = st.session_state.batch_id
     if not bid:
-        st.info("Pick a data source in the sidebar and click **Run pipeline** to start.")
+        st.info("Click **Run pipeline** in the sidebar to start — data is pulled directly "
+                "from Databricks and the AWS accounts API.")
         return
 
     try:
@@ -274,17 +273,13 @@ def _approve_block(bid, rows: list[dict], is_aws: bool, suffix: str) -> None:
     sel = _selected(event, rows)
     n = len(sel)
     b1, b2, b3 = st.columns([1, 1, 2.2])
-    approve = b1.button(f"✓ Approve selected ({n})", type="primary", disabled=n == 0,
-                        width="stretch", key=f"approve_btn_{suffix}")
-    reject = b2.button(f"↩ Reject → send to review ({n})", disabled=n == 0,
+    # Committing is disabled for now — the Approve button is inert (nothing is written).
+    b1.button(f"✓ Approve selected ({n})", type="primary", disabled=n == 0,
+              width="stretch", key=f"approve_btn_{suffix}")
+    reject = b2.button(f"↩ Send to review ({n})", disabled=n == 0,
                        width="stretch", key=f"reject_btn_{suffix}")
-    b3.caption("**Approve** commits the predicted ID to the learning data (retrains next "
-               "run). **Reject** moves the rows to the Review queue instead.")
-    if approve and sel:
-        _do(lambda: api_client.commit(
-            bid, [{"row_id": r["row_id"],
-                   "recharging_item_id": r["predicted_recharging_item_id"]} for r in sel]),
-            f"Approved & committed {n} row(s). Retrains next run.")
+    b3.caption("Approving is **disabled for now** — nothing is committed. Use **⬇ Download "
+               "CSV** above to export. **Send to review** just moves rows to the Review tab.")
     if reject and sel:
         _do(lambda: api_client.reroute(bid, [r["row_id"] for r in sel]),
             f"Moved {n} row(s) to the Review queue.")
@@ -295,9 +290,9 @@ def _approve_tab(bid):
     if not rows:
         st.success("Nothing awaiting approval right now. 🎉")
         return
-    st.caption("**Select rows** with the checkboxes, then use the buttons below "
-               "(nothing is ever auto-approved — a human always confirms). AWS and Azure "
-               "are shown separately, each with the columns that apply.")
+    st.caption("Review the predictions below and **⬇ Download CSV** to export them. AWS "
+               "and Azure are shown separately, each with the columns that apply. "
+               "(Committing is disabled for now.)")
     for label, emoji, is_aws, suffix, subset in _provider_sections(rows):
         st.markdown(f"#### {emoji} {label} ({len(subset)})")
         _approve_block(bid, subset, is_aws, suffix)
@@ -373,25 +368,12 @@ def _review_block(bid, rows: list[dict], is_aws: bool, suffix: str) -> None:
     _download_csv(df, f"review_queue_{suffix}.csv", f"dl_review_{suffix}")
     sel = _selected(event, rows)
     n = len(sel)
-    correction = st.text_input(
-        "Correct Recharging_Item_ID (for Reject & correct)", key=f"review_correction_{suffix}",
-        placeholder="e.g. PSO_ITM_9999").strip()
-    b1, b2, b3 = st.columns([1.2, 1.2, 2])
-    approve = b1.button(f"✓ Approve & commit ({n})", type="primary", disabled=n == 0,
-                        width="stretch", key=f"rev_approve_{suffix}")
-    reject = b2.button(f"✗ Reject & correct ({n})", disabled=(n == 0 or not correction),
-                       width="stretch", key=f"rev_reject_{suffix}")
-    b3.caption("**Approve** commits the agent's prediction. **Reject & correct** commits "
-               "the value typed above to the selected row(s) instead.")
-    if approve and sel:
-        _do(lambda: api_client.commit(
-            bid, [{"row_id": r["row_id"],
-                   "recharging_item_id": r["agent_prediction"]} for r in sel]),
-            f"Committed {n} row(s). Retrains next run.")
-    if reject and sel and correction:
-        _do(lambda: api_client.commit(
-            bid, [{"row_id": r["row_id"], "recharging_item_id": correction} for r in sel]),
-            f"Committed correction to {n} row(s). Retrains next run.")
+    # Committing is disabled for now — the Approve button is inert (nothing is written).
+    b1, b2 = st.columns([1.2, 3])
+    b1.button(f"✓ Approve ({n})", type="primary", disabled=n == 0,
+              width="stretch", key=f"rev_approve_{suffix}")
+    b2.caption("Approving is **disabled for now** — nothing is committed. Use **⬇ Download "
+               "CSV** above to export the review queue.")
 
 
 def _review_tab(bid, review_status):
@@ -405,9 +387,9 @@ def _review_tab(bid, review_status):
     if not rows:
         st.success("No rows to review. 🎉")
         return
-    st.caption("The LLM analyzed the review rows. **Select** rows, then **Approve** the "
-               "agent's prediction — or **Reject & correct** with the value you type below. "
-               "AWS and Azure are shown separately, each with the columns that apply.")
+    st.caption("The LLM analyzed the review rows. Review the agent's prediction and "
+               "**⬇ Download CSV** to export. AWS and Azure are shown separately, each "
+               "with the columns that apply. (Committing is disabled for now.)")
     for label, emoji, is_aws, suffix, subset in _provider_sections(rows):
         st.markdown(f"#### {emoji} {label} ({len(subset)})")
         _review_block(bid, subset, is_aws, suffix)

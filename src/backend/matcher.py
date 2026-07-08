@@ -69,11 +69,18 @@ EMPTY_COLS = COLS
 #   aws_desc AwsAccountTags.local.description    AwsAccountTags.description
 #   aws_name AwsAccountTags.global.app          AwsAccountTags.name  (deanonymises GUIDs)
 # The first non-blank source wins; absent columns (e.g. V3 workbooks) are skipped.
+# Canonical AWS enrichment column names the accounts source (aws_accounts.py) WRITES and
+# these models READ — the single source of truth for that contract; aws_accounts imports
+# them so a rename here can't silently desync the join.
+AWS_OWNER_COL = "AwsAccountTags.owner"
+AWS_DCS_COL = "AwsAccountTags.global.dcs"
+AWS_DESC_COL = "AwsAccountTags.local.description"
+AWS_NAME_COL = "AwsAccountTags.name"
 AWS_TAG_SOURCES = {
-    "aws_owner": ["AwsAccountTags.owner"],
-    "aws_dcs": ["AwsAccountTags.global.dcs"],
-    "aws_desc": ["AwsAccountTags.local.description", "AwsAccountTags.description"],
-    "aws_name": ["AwsAccountTags.global.app", "AwsAccountTags.name"],
+    "aws_owner": [AWS_OWNER_COL],
+    "aws_dcs": [AWS_DCS_COL],
+    "aws_desc": [AWS_DESC_COL, "AwsAccountTags.description"],
+    "aws_name": ["AwsAccountTags.global.app", AWS_NAME_COL],
 }
 
 # Provider buckets. One classifier per bucket; anything not AWS is treated as Azure
@@ -200,6 +207,18 @@ CANDIDATE_CAP = 10
 # drop them from training even if they reappear in the data after a manual clean-up.
 PLACEHOLDER_IDS = {"XX_TOIDENTIFY"}
 
+# Recharging_Item_ID values that are NOT a real, learnable mapping (the row is still "to
+# identify"): blanks, null-like strings, and the placeholders above. Single source of truth
+# for the mapped-vs-empty policy — used by both data_source._split (routing) and
+# trainable_rows (training), so the two ends can't drift apart.
+_NON_ID_VALUES = PLACEHOLDER_IDS | {"", "NAN", "NONE"}
+
+
+def has_real_id(series: "pd.Series") -> "pd.Series":
+    """Boolean mask: rows whose Recharging_Item_ID is a real, non-placeholder mapping."""
+    ids = series.astype(str).str.strip().str.upper()
+    return series.notna() & ~ids.isin(_NON_ID_VALUES)
+
 # Suggested next action for a predicted row (two buckets):
 #   • high-confidence  -> ready for a human to batch-approve (we NEVER auto-commit,
 #     even at 100% — a person always confirms).
@@ -224,9 +243,7 @@ def suggested_action(match_method: str, needs_review: bool,
 
 def trainable_rows(df: pd.DataFrame, id_col: str) -> pd.DataFrame:
     """Rows usable for training: a real, non-blank, non-placeholder Recharging_Item_ID."""
-    ids = df[id_col].astype(str).str.strip()
-    keep = df[id_col].notna() & ~ids.str.upper().isin(PLACEHOLDER_IDS | {"", "NAN"})
-    return df[keep].copy()
+    return df[has_real_id(df[id_col])].copy()
 
 # An opaque name = a GUID/hash or a very short token. Carries no learnable signal.
 _OPAQUE_NAME = re.compile(r"^[0-9a-f]{16,}$")
